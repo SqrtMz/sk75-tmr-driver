@@ -1,0 +1,24 @@
+[package]
+name = "sk75-tmr-driver"
+version = "0.1.0"
+edition = "2021"
+description = "Linux Rust recreation of WOMIER SK75 TMR driver - TMR analog switch readout via HID feature reports"
+license = "MIT"
+
+[[bin]]
+name = "sk75-tmr"
+path = "src/main.rs"
+
+[[bin]]
+name = "sk75-tmr-ui"
+path = "src/ui.rs"
+
+[dependencies]
+hidapi = "2.6"
+eframe = "0.32"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+log = "0.4"
+env_logger = "0.11"
+
+[dev-dependencies]
