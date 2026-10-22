@@ -3,10 +3,11 @@
 //! Layout mirrors the original Electron panel (`dist/index.html` title
 //! `GearHub`, `dist/js/f70eb088.js` device card with firmware-version +
 //! firmware-upgrade and IOT-version + check-update rows): a device card with a
-//! **read keyboard information** action, plus TMR analog + calibration
-//! tabs backed by the same `hid`/`proto`/`matrix`/`device_info` code as
-//! the CLI. REA: `analyze_javascript_application` summary `ev_a9d5046b…`
-//! + module page `ev_43d23e55…`.
+//! **read keyboard information** action, plus the on-screen keyboard with
+//! live analog values, rebinding, switch selection and per-key travel
+//! calibration backed by the same `hid`/`proto`/`matrix`/`device_info` code.
+//! REA: `analyze_javascript_application` summary `ev_a9d5046b…`
+//! + module page `ev_43d23e55…`; calibration parent `ev_01e3780a…`.
 
 mod device_info;
 mod hid;
@@ -18,21 +19,156 @@ mod switches;
 
 use device_info::{read_keyboard_info, KeyboardInfo};
 use eframe::egui;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Tab {
     Device,
     Keyboard,
-    Calibration,
 }
 
 struct KeyBar {
     slot: usize,
-    hid: u32,
-    name: String,
     raw: u16,
     mm: f32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CalibrationPhase {
+    Idle,
+    /// `setJiaoZhunKaiGuan(true)` part 1: cmd 28 on, held for 2 s.
+    StartingMin,
+    /// cmd 28 off + cmd 30 on; original waits another 500 ms before the UI
+    /// is allowed to enter `ing_调用中`.
+    Settling,
+    /// Guide's Start button is enabled; no key polling until it is clicked.
+    Ready,
+    /// Guide dismissed, op-254 polling runs and keys may be pressed.
+    Active,
+    /// cmd 30 off; every calibrated key remains locked at full travel.
+    Complete,
+    Failed,
+}
+
+/// Mirrors the original `state_行程校准` + `calibratedKeyCodeSet`:
+/// raw op-254 travel values, the threshold from firmware version, and the
+/// set of keys that reached it (which stay at 100% after release).
+struct CalibrationSession {
+    phase: CalibrationPhase,
+    guide_open: bool,
+    vid: u16,
+    pid: u16,
+    dev: Option<hid::Sk75>,
+    raw: Vec<u16>,
+    calibrated: Vec<bool>,
+    expected: Vec<usize>,
+    threshold: u16,
+    phase_start: Instant,
+    message: String,
+    min_cal_on: bool,
+    max_cal_on: bool,
+}
+
+impl CalibrationSession {
+    fn idle() -> Self {
+        Self {
+            phase: CalibrationPhase::Idle,
+            guide_open: false,
+            vid: proto::VID_RONGYUAN,
+            pid: proto::PID_SK75_TMR,
+            dev: None,
+            raw: vec![0; 128],
+            calibrated: vec![false; 128],
+            expected: Vec::new(),
+            threshold: 300,
+            phase_start: Instant::now(),
+            message: String::new(),
+            min_cal_on: false,
+            max_cal_on: false,
+        }
+    }
+
+    fn needs_tick(&self) -> bool {
+        matches!(
+            self.phase,
+            CalibrationPhase::StartingMin | CalibrationPhase::Settling | CalibrationPhase::Active
+        )
+    }
+
+    fn overlay_visible(&self) -> bool {
+        matches!(
+            self.phase,
+            CalibrationPhase::Active | CalibrationPhase::Complete
+        )
+    }
+
+    fn calibrated_count(&self) -> usize {
+        self.expected
+            .iter()
+            .filter(|s| self.calibrated.get(**s).copied().unwrap_or(false))
+            .count()
+    }
+
+    fn all_done(&self) -> bool {
+        !self.expected.is_empty() && self.calibrated_count() == self.expected.len()
+    }
+
+    /// Original `mj` overlay: calibrated -> 80% opacity at 100% height;
+    /// raw >= threshold -> lock + 80%; 0 < raw < threshold -> 30% partial.
+    /// Returns `(locked, height_fraction)`.
+    fn overlay_for(&self, slot: usize) -> Option<(bool, f32)> {
+        if !self.overlay_visible() || self.threshold == 0 {
+            return None;
+        }
+        if self.calibrated.get(slot).copied().unwrap_or(false) {
+            return Some((true, 1.0));
+        }
+        let raw = self.raw.get(slot).copied().unwrap_or(0);
+        if raw == 0 {
+            None
+        } else {
+            Some((false, (raw as f32 / self.threshold as f32).clamp(0.0, 1.0)))
+        }
+    }
+
+    /// Add every expected slot that has reached the threshold. Keys are never
+    /// removed, so a released key stays green at full height.
+    fn observe(&mut self) {
+        let threshold = self.threshold;
+        for &slot in &self.expected {
+            let raw = self.raw.get(slot).copied().unwrap_or(0);
+            if raw >= threshold {
+                if let Some(v) = self.calibrated.get_mut(slot) {
+                    *v = true;
+                }
+            }
+        }
+    }
+}
+
+impl Drop for CalibrationSession {
+    fn drop(&mut self) {
+        // Never leave min/max calibration armed if the window closes. The
+        // keyboard may have just re-enumerated, so retry with a fresh handle.
+        let mut dev = self.dev.take();
+        if dev.is_none() && (self.min_cal_on || self.max_cal_on) {
+            for _ in 0..3 {
+                if let Ok(d) = hid::open_sk75(self.vid, self.pid, None, None) {
+                    dev = Some(d);
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        }
+        if let Some(dev) = dev {
+            if self.min_cal_on {
+                let _ = dev.set_min_travel_cal(false);
+            }
+            if self.max_cal_on {
+                let _ = dev.set_max_travel_cal(false);
+            }
+        }
+    }
 }
 
 struct App {
@@ -48,8 +184,7 @@ struct App {
     poll_window_start: Option<Instant>,
     hz: f64,
     last_layer: Option<(u8, u8)>,
-    cal_busy: bool,
-    cal_msg: String,
+    calibration: CalibrationSession,
     // Remap tab state (mirrors driver key-rebind panel: profile/Fn layers,
     // per-key binding list, binding-type options, single-key write).
     remap_profile: u8,
@@ -91,8 +226,7 @@ impl App {
             poll_window_start: None,
             hz: 0.0,
             last_layer: None,
-            cal_busy: false,
-            cal_msg: String::new(),
+            calibration: CalibrationSession::idle(),
             remap_profile: 0,
             remap_fn: 0,
             remap_entries: Vec::new(),
@@ -130,7 +264,9 @@ impl App {
         match hid::open_sk75(self.vid, self.pid, self.path_opt(), None) {
             Ok(dev) => match dev.get_profile() {
                 Ok(Some(p)) if p <= 3 => self.remap_profile = p,
-                Ok(Some(p)) => self.status = format!("Device reports invalid profile {p}; keeping selector."),
+                Ok(Some(p)) => {
+                    self.status = format!("Device reports invalid profile {p}; keeping selector.")
+                }
                 Ok(None) => {}
                 Err(e) => self.status = format!("Current profile read failed: {e:#}"),
             },
@@ -165,15 +301,13 @@ impl App {
         };
         let mat = matrix::default_matrix(self.info.device_id);
         let mut bars = Vec::new();
-        for (slot, h) in matrix::populated_keys(mat) {
+        for (slot, _) in matrix::populated_keys(mat) {
             let r = travel.get(slot).copied().unwrap_or(0);
             if r == 0 {
                 continue;
             }
             bars.push(KeyBar {
                 slot,
-                hid: h,
-                name: matrix::hid_name(h),
                 raw: r,
                 mm: proto::raw_to_mm(r, scale),
             });
@@ -205,15 +339,13 @@ impl App {
         };
         let mat = matrix::default_matrix(self.info.device_id);
         let mut bars = Vec::new();
-        for (slot, h) in matrix::populated_keys(mat) {
+        for (slot, _) in matrix::populated_keys(mat) {
             let r = travel.get(slot).copied().unwrap_or(0);
             if r == 0 {
                 continue;
             }
             bars.push(KeyBar {
                 slot,
-                hid: h,
-                name: matrix::hid_name(h),
                 raw: r,
                 mm: proto::raw_to_mm(r, scale),
             });
@@ -240,6 +372,292 @@ impl App {
                 String::new()
             },
         );
+    }
+
+    /// Start the original `setJiaoZhunKaiGuan(true)` sequence without
+    /// blocking the UI: cmd 28 on now, cmd 28 off + cmd 30 on after 2 s,
+    /// then the guide becomes startable after another 500 ms.
+    fn begin_travel_calibration(&mut self) {
+        if matches!(
+            self.calibration.phase,
+            CalibrationPhase::StartingMin
+                | CalibrationPhase::Settling
+                | CalibrationPhase::Ready
+                | CalibrationPhase::Active
+        ) {
+            return;
+        }
+        self.polling = false;
+        let dev = match hid::open_sk75(self.vid, self.pid, self.path_opt(), None) {
+            Ok(d) => d,
+            Err(e) => {
+                let mut cal = CalibrationSession::idle();
+                cal.phase = CalibrationPhase::Failed;
+                cal.message = format!("{e:#}. Hint: wired mode + udev/99-sk75-tmr.rules");
+                self.calibration = cal;
+                return;
+            }
+        };
+        // Same source as the original overlay: `version.rf ?? version.usb`.
+        let usb = dev.usb_version().ok().flatten().or(self.info.usb_version);
+        if usb.is_some() {
+            self.info.usb_version = usb;
+        }
+        let rf = dev.rf_version().ok().flatten();
+        let threshold = proto::calibration_threshold(usb, rf);
+        let device_id = dev.device_id().ok().flatten().or(self.info.device_id);
+        if device_id.is_some() {
+            self.info.device_id = device_id;
+        }
+        let expected = layout::all_slots(matrix::default_matrix(device_id));
+        let expected_len = expected.len();
+        let mut cal = CalibrationSession {
+            phase: CalibrationPhase::StartingMin,
+            guide_open: true,
+            vid: self.vid,
+            pid: self.pid,
+            dev: None,
+            raw: vec![0; 128],
+            calibrated: vec![false; 128],
+            expected,
+            threshold,
+            phase_start: Instant::now(),
+            message: format!(
+                "Starting calibration, please wait... (threshold {threshold}, {expected_len} keys)"
+            ),
+            min_cal_on: false,
+            max_cal_on: false,
+        };
+        match dev.set_min_travel_cal(true) {
+            Ok(()) => {
+                cal.min_cal_on = true;
+                cal.phase_start = Instant::now();
+                cal.dev = Some(dev);
+                self.calibration = cal;
+            }
+            Err(e) => {
+                cal.phase = CalibrationPhase::Failed;
+                cal.guide_open = false;
+                cal.message = format!("Min-travel calibration failed: {e:#}");
+                self.calibration = cal;
+            }
+        }
+    }
+
+    fn tick_calibration(&mut self) {
+        match self.calibration.phase {
+            CalibrationPhase::StartingMin
+                if self.calibration.phase_start.elapsed() >= Duration::from_secs(2) =>
+            {
+                let res = if let Some(dev) = self.calibration.dev.as_ref() {
+                    dev.set_min_travel_cal(false)
+                        .and_then(|_| dev.set_max_travel_cal(true))
+                        .map_err(|e| format!("{e:#}"))
+                } else {
+                    Err(String::from("calibration device closed"))
+                };
+                match res {
+                    Ok(()) => {
+                        self.calibration.min_cal_on = false;
+                        self.calibration.max_cal_on = true;
+                        self.calibration.phase = CalibrationPhase::Settling;
+                        self.calibration.phase_start = Instant::now();
+                        self.calibration.message =
+                            String::from("Starting calibration, please wait...");
+                    }
+                    Err(e) => self.fail_calibration(format!("Calibration start failed: {e}")),
+                }
+            }
+            CalibrationPhase::Settling
+                if self.calibration.phase_start.elapsed() >= Duration::from_millis(500) =>
+            {
+                self.calibration.phase = CalibrationPhase::Ready;
+                self.calibration.message = format!(
+                    "Calibration is armed. Click Start Calibration, then press all {} keys.",
+                    self.calibration.expected.len()
+                );
+            }
+            CalibrationPhase::Active => self.poll_calibration(),
+            _ => {}
+        }
+    }
+
+    fn start_calibration_preview(&mut self) {
+        if self.calibration.phase != CalibrationPhase::Ready {
+            return;
+        }
+        self.calibration.guide_open = false;
+        self.calibration.phase = CalibrationPhase::Active;
+        self.calibration.message = String::from(
+            "Press each key fully and hold it briefly. A key locks at full travel when it turns green.",
+        );
+        self.poll_calibration();
+    }
+
+    /// The SK75 can re-enumerate after entering max-travel calibration (the
+    /// hidraw path changes). Drop the stale handle and open the vendor
+    /// interface again by VID:PID, retrying while udev/hidapi catch up.
+    fn reconnect_calibration_device(&mut self, attempts: usize) -> Result<(), String> {
+        self.calibration.dev = None;
+        let mut last = String::from("device not found");
+        for attempt in 0..attempts {
+            match hid::open_sk75(self.calibration.vid, self.calibration.pid, None, None) {
+                Ok(dev) => {
+                    self.calibration.dev = Some(dev);
+                    return Ok(());
+                }
+                Err(e) => {
+                    last = format!("{e:#}");
+                    if attempt + 1 < attempts {
+                        std::thread::sleep(Duration::from_millis(200));
+                    }
+                }
+            }
+        }
+        Err(last)
+    }
+
+    fn poll_calibration(&mut self) {
+        let mut last_err = String::new();
+        for attempt in 0..2 {
+            let res = if let Some(dev) = self.calibration.dev.as_ref() {
+                dev.live_travel_raw().map_err(|e| format!("{e:#}"))
+            } else {
+                Err(String::from("calibration device closed"))
+            };
+            match res {
+                Ok(v) => {
+                    let n = v.len().min(self.calibration.raw.len());
+                    self.calibration.raw[..n].copy_from_slice(&v[..n]);
+                    if n < self.calibration.raw.len() {
+                        self.calibration.raw[n..].fill(0);
+                    }
+                    self.calibration.observe();
+                    let (done, total) = (
+                        self.calibration.calibrated_count(),
+                        self.calibration.expected.len(),
+                    );
+                    if self.calibration.all_done() {
+                        self.calibration.message = String::from(
+                            "All keys calibrated. Click Finish calibration to turn max-cal off.",
+                        );
+                    } else {
+                        self.calibration.message = format!(
+                            "{done} / {total} keys calibrated. Keep pressing the remaining keys."
+                        );
+                    }
+                    if attempt > 0 {
+                        self.calibration.message =
+                            format!("Keyboard reconnected. {}", self.calibration.message);
+                    }
+                    return;
+                }
+                Err(e) => {
+                    last_err = e;
+                    if attempt == 0 {
+                        if let Err(re) = self.reconnect_calibration_device(5) {
+                            last_err = format!("{last_err}; reconnect failed: {re}");
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        self.fail_calibration(format!("Calibration read failed: {last_err}"));
+    }
+
+    fn finish_travel_calibration(&mut self) {
+        if !self.calibration.all_done() {
+            self.calibration.message = String::from("Press and calibrate every key first.");
+            return;
+        }
+        let stop = self.stop_calibration_hardware();
+        self.calibration.phase = CalibrationPhase::Complete;
+        self.calibration.guide_open = false;
+        self.calibration.message = match stop {
+            Ok(()) => String::from("Calibration Complete."),
+            Err(e) => format!("Calibration Complete, but max-cal off failed: {e}"),
+        };
+        self.snapshot_preview();
+    }
+
+    fn cancel_travel_calibration(&mut self) {
+        let stop = self.stop_calibration_hardware();
+        self.calibration.phase = if stop.is_ok() {
+            CalibrationPhase::Idle
+        } else {
+            CalibrationPhase::Failed
+        };
+        self.calibration.guide_open = false;
+        self.calibration.raw.fill(0);
+        self.calibration.calibrated.fill(false);
+        self.calibration.message = match stop {
+            Ok(()) => String::from("Calibration cancelled; min/max calibration is off."),
+            Err(e) => format!("Calibration stopped with an error: {e}"),
+        };
+        self.snapshot_preview();
+    }
+
+    fn stop_calibration_hardware(&mut self) -> Result<(), String> {
+        let mut errors = Vec::new();
+        for attempt in 0..4 {
+            if !self.calibration.min_cal_on && !self.calibration.max_cal_on {
+                self.calibration.dev = None;
+                return Ok(());
+            }
+            if self.calibration.dev.is_none() {
+                if let Err(e) = self.reconnect_calibration_device(3) {
+                    errors.push(format!("reconnect: {e}"));
+                    continue;
+                }
+            }
+            let dev = self.calibration.dev.as_ref().expect("just reconnected");
+            let mut failed = false;
+            if self.calibration.min_cal_on {
+                match dev.set_min_travel_cal(false) {
+                    Ok(()) => self.calibration.min_cal_on = false,
+                    Err(e) => {
+                        errors.push(format!("min-cal off: {e:#}"));
+                        failed = true;
+                    }
+                }
+            }
+            if self.calibration.max_cal_on {
+                match dev.calibrate_stop() {
+                    Ok(()) => self.calibration.max_cal_on = false,
+                    Err(e) => {
+                        errors.push(format!("max-cal off: {e:#}"));
+                        failed = true;
+                    }
+                }
+            }
+            if !failed {
+                self.calibration.dev = None;
+                return Ok(());
+            }
+            // Almost always a stale handle after USB re-enumeration.
+            self.calibration.dev = None;
+            if attempt < 3 {
+                std::thread::sleep(Duration::from_millis(250));
+            }
+        }
+        if self.calibration.min_cal_on || self.calibration.max_cal_on {
+            // Drop still has the VID:PID and will try once more with a fresh
+            // handle if the session is closed.
+            Err(errors.join("; "))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn fail_calibration(&mut self, message: String) {
+        let stop = self.stop_calibration_hardware();
+        self.calibration.phase = CalibrationPhase::Failed;
+        self.calibration.guide_open = false;
+        self.calibration.message = match stop {
+            Ok(()) => message,
+            Err(e) => format!("{message}; stop failed: {e}"),
+        };
     }
 
     fn read_remap(&mut self) {
@@ -374,8 +792,7 @@ impl App {
                 let (skey, key2) = match (u8::try_from(c[0]), u8::try_from(c[2])) {
                     (Ok(s), Ok(k2)) => (s, k2),
                     _ => {
-                        self.remap_msg =
-                            String::from("Combo key out of one-byte range; re-pick.");
+                        self.remap_msg = String::from("Combo key out of one-byte range; re-pick.");
                         return;
                     }
                 };
@@ -570,11 +987,12 @@ impl App {
             Ok((p, l)) => {
                 self.travel_press = p;
                 self.travel_lift = l;
-                self.switch_msg.push_str(" Activation travels read (ops 0/1).");
+                self.switch_msg
+                    .push_str(" Activation travels read (ops 0/1).");
             }
-            Err(e) => {
-                self.switch_msg.push_str(&format!(" Travel read failed: {e:#}"))
-            }
+            Err(e) => self
+                .switch_msg
+                .push_str(&format!(" Travel read failed: {e:#}")),
         }
     }
 
@@ -602,8 +1020,9 @@ impl App {
                     // and still reported success, so verify persistence.
                     self.read_switches();
                     let actual = self.switch_codes.get(slot).copied().unwrap_or(0);
-                    if let Some(pos) =
-                        switches::SK75_SWITCHES.iter().position(|(c, _)| *c == actual)
+                    if let Some(pos) = switches::SK75_SWITCHES
+                        .iter()
+                        .position(|(c, _)| *c == actual)
                     {
                         self.selected_switch = pos;
                     }
@@ -626,7 +1045,12 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if self.polling {
+        if self.calibration.needs_tick() {
+            // The 2 s min-cal wait and the 500 ms settle are timer-driven;
+            // op-254 polling then runs every frame like the original loop.
+            self.tick_calibration();
+            ctx.request_repaint();
+        } else if self.polling {
             // No inter-poll sleep: poll every frame and repaint continuously
             // for the max HID-bound rate, like the original live loop.
             self.poll_once();
@@ -636,11 +1060,7 @@ impl eframe::App for App {
             ui.horizontal(|ui| {
                 ui.heading("SK75 TMR — Linux driver");
                 ui.separator();
-                for (tab, label) in [
-                    (Tab::Device, "Device info"),
-                    (Tab::Keyboard, "Keyboard"),
-                    (Tab::Calibration, "Calibration"),
-                ] {
+                for (tab, label) in [(Tab::Device, "Device info"), (Tab::Keyboard, "Keyboard")] {
                     ui.selectable_value(&mut self.tab, tab, label);
                 }
             });
@@ -648,8 +1068,8 @@ impl eframe::App for App {
         egui::CentralPanel::default().show(ctx, |ui| match self.tab {
             Tab::Device => device_tab(ui, self),
             Tab::Keyboard => keyboard_tab(ui, self),
-            Tab::Calibration => calibration_tab(ui, self),
         });
+        calibration_guide(ctx, self);
     }
 }
 
@@ -670,20 +1090,23 @@ fn device_tab(ui: &mut egui::Ui, app: &mut App) {
     }
     ui.separator();
     let info = &app.info;
-    egui::Grid::new("info-grid").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
-        row(ui, "Display", &info.display_name);
-        row(ui, "VID:PID (hex)", &info.vid_pid_hex());
-        row(ui, "VID:PID (dec)", &info.vid_pid_dec());
-        row(ui, "Path", &info.path);
-        row(ui, "Product", &info.product);
-        row(ui, "Manufacturer", &info.manufacturer);
-        row(ui, "Device ID", &info.device_id_text());
-        row(ui, "Variant", &info.variant);
-        row(ui, "USB version", &info.usb_version_text());
-        row(ui, "Precision", &info.precision_text());
-        row(ui, "Report rate", &info.report_rate_text());
-        row(ui, "Keys", &info.key_count.to_string());
-    });
+    egui::Grid::new("info-grid")
+        .num_columns(2)
+        .spacing([12.0, 6.0])
+        .show(ui, |ui| {
+            row(ui, "Display", &info.display_name);
+            row(ui, "VID:PID (hex)", &info.vid_pid_hex());
+            row(ui, "VID:PID (dec)", &info.vid_pid_dec());
+            row(ui, "Path", &info.path);
+            row(ui, "Product", &info.product);
+            row(ui, "Manufacturer", &info.manufacturer);
+            row(ui, "Device ID", &info.device_id_text());
+            row(ui, "Variant", &info.variant);
+            row(ui, "USB version", &info.usb_version_text());
+            row(ui, "Precision", &info.precision_text());
+            row(ui, "Report rate", &info.report_rate_text());
+            row(ui, "Keys", &info.key_count.to_string());
+        });
     ui.separator();
     ui.label(format!("Status: {}", app.status));
     if let Some(e) = &info.error {
@@ -760,370 +1183,449 @@ fn keyboard_tab(ui: &mut egui::Ui, app: &mut App) {
     if !app.switch_msg.is_empty() {
         ui.small(&app.switch_msg);
     }
-    let mat = matrix::default_matrix(app.info.device_id);
-    let live: std::collections::HashMap<usize, f32> =
-        app.bars.iter().map(|b| (b.slot, b.mm)).collect();
-    // Sized to ~50% of the screen width (responsive) and CENTERED in the
-    // window; keys additionally grow into their inter-key gaps, and per-key
-    // text is fitted to each key rect.
-    let screen_w = ui.ctx().screen_rect().width();
-    let target = (screen_w * 0.50).max(420.0);
-    let k = ((target - 16.0) / layout::CANVAS_W).clamp(0.75, 3.4);
-    let (ox, oy) = (8.0, 8.0);
-    let (resp, painter) = ui
-        .with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
-            ui.allocate_painter(
-                egui::Vec2::new(layout::CANVAS_W * k + 16.0, layout::CANVAS_H * k + 16.0),
-                egui::Sense::click(),
-            )
-        })
-        .inner;
-    // Colors straight from the driver key template `KeyBox_KeyMappings_RT`
-    // (dist/js/2a8cd9c4.js): press value #FE4545 bottom-left, release value
-    // #0066FF bottom-right, selected outline rgba(253.94,68.77,68.77).
-    const PRESS_COL: egui::Color32 = egui::Color32::from_rgb(0xFE, 0x45, 0x45);
-    const LIFT_COL: egui::Color32 = egui::Color32::from_rgb(0x00, 0x66, 0xFF);
-    const SELECT_COL: egui::Color32 = egui::Color32::from_rgb(0xFD, 0x44, 0x44);
-    // Reference full-stroke travel for the live % readout and depth tint
-    // (magnetic switches: ~4.0 mm nominal total travel).
-    const FULL_TRAVEL_MM: f32 = 4.0;
-    // Travel display decimals: driver `travelPrecision` getter.
-    let digits = app.travel_digits;
-    let scale_mm = app.info.scale.max(1);
-    let of_slot = |raw: &[u16], slot: Option<usize>| -> Option<f32> {
-        let r = *raw.get(slot?)?;
-        (r != 0).then(|| proto::raw_to_mm(r, scale_mm))
-    };
-    let mut hover_info: Option<String> = None;
-    for (lid, hid, x, y, w, hgt, label) in layout::KEYS {
-        // Keys grow slightly INTO the inter-key gaps (asset pitch 46 vs the
-        // 40-wide unit keys) so each key reads bigger without changing the
-        // layout geometry; the fitted text sizes keep every row separated.
-        let inf = 1.7 * k;
-        let rect = egui::Rect::from_min_max(
-            resp.rect.min + egui::Vec2::new(ox + x * k - inf, oy + y * k - inf),
-            resp.rect.min
-                + egui::Vec2::new(ox + (x + w) * k + inf, oy + (y + hgt) * k + inf),
-        );
-        let slot = layout::slot_for(hid, mat);
-        let mm = slot.and_then(|s| live.get(&s).copied()).unwrap_or(0.0);
-        let depth = (mm / FULL_TRAVEL_MM).clamp(0.0, 1.0);
-        let selected = slot
-            .and_then(|s| {
-                app.remap_entries
-                    .iter()
-                    .position(|e| e.slot == s)
-                    .map(|i| Some(i) == app.remap_selected)
-            })
-            .unwrap_or(false);
-        let binding = slot
-            .and_then(|s| {
-                app.remap_entries
-                    .iter()
-                    .find(|e| e.slot == s)
-                    .map(|e| e.binding.short_label())
-            })
-            .unwrap_or_default();
-        let sw_code = slot
-            .and_then(|s| app.switch_codes.get(s).copied())
-            .unwrap_or(0xFF);
-        let [sr, sg, sb] = switches::switch_color(sw_code);
-        // Live-input activation: once the current depth reaches the key's
-        // configured press-travel activation point, the fill turns black
-        // (auto-contrast text goes white) and a layered red glow radiates
-        // around the key so the actuation moment is unmistakable.
-        let act_mm = of_slot(&app.travel_press, slot);
-        let activated = mm > 0.0005 && act_mm.is_some_and(|a| mm >= a);
-        // Key fill = the selected switch's driver color; live press depth
-        // lightens it (kept aesthetic on the dark panel).
-        let lit = |c: u8| (c as f32 + (255.0 - c as f32) * depth * 0.55).round() as u8;
-        let fill = if activated {
-            egui::Color32::from_rgb(0x0D, 0x0D, 0x0D)
-        } else {
-            egui::Color32::from_rgb(lit(sr), lit(sg), lit(sb))
-        };
-        let round = egui::CornerRadius {
-            nw: (5.0 * k) as u8,
-            ne: (5.0 * k) as u8,
-            sw: (5.0 * k) as u8,
-            se: (5.0 * k) as u8,
-        };
-        painter.rect_filled(rect, round, fill);
-        // Activation glow: layered outer strokes (driver activation red,
-        // alpha decaying outward) around the active key.
-        if activated {
-            for (grow, alpha) in [
-                (0.0_f32, 0.65_f32),
-                (2.4, 0.45),
-                (4.8, 0.28),
-                (7.2, 0.16),
-                (9.6, 0.08),
-            ] {
-                let r = (5.0 * k + grow * k) as u8;
-                painter.rect_stroke(
-                    rect.expand2(egui::Vec2::splat(grow * k)),
-                    egui::CornerRadius {
-                        nw: r,
-                        ne: r,
-                        sw: r,
-                        se: r,
-                    },
-                    egui::Stroke::new(2.0 * k, PRESS_COL.gamma_multiply(alpha)),
-                    egui::StrokeKind::Outside,
+    ui.horizontal_top(|ui| {
+        calibration_panel(ui, app);
+        ui.add_space(10.0);
+        ui.vertical(|ui| {
+            let mat = matrix::default_matrix(app.info.device_id);
+            let live: std::collections::HashMap<usize, f32> =
+                app.bars.iter().map(|b| (b.slot, b.mm)).collect();
+            // Sized to ~50% of the screen width (responsive) and CENTERED in the
+            // remaining space to the right of the calibration option; keys
+            // additionally grow into their inter-key gaps, and per-key text is
+            // fitted to each key rect.
+            let screen_w = ui.ctx().screen_rect().width();
+            let avail_w = ui.available_width().max(320.0);
+            let target = (screen_w * 0.50).min(avail_w * 0.96).max(420.0);
+            let k = ((target - 16.0) / layout::CANVAS_W).clamp(0.60, 3.4);
+            let (ox, oy) = (8.0, 8.0);
+            // Keep the preview column exactly as wide as the fitted board,
+            // immediately to the right of the calibration card.
+            ui.set_width(target);
+            let (resp, painter) = ui
+                .with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
+                    ui.allocate_painter(
+                        egui::Vec2::new(layout::CANVAS_W * k + 16.0, layout::CANVAS_H * k + 16.0),
+                        egui::Sense::click(),
+                    )
+                })
+                .inner;
+            // Colors straight from the driver key template `KeyBox_KeyMappings_RT`
+            // (dist/js/2a8cd9c4.js): press value #FE4545 bottom-left, release value
+            // #0066FF bottom-right, selected outline rgba(253.94,68.77,68.77).
+            const PRESS_COL: egui::Color32 = egui::Color32::from_rgb(0xFE, 0x45, 0x45);
+            const LIFT_COL: egui::Color32 = egui::Color32::from_rgb(0x00, 0x66, 0xFF);
+            const SELECT_COL: egui::Color32 = egui::Color32::from_rgb(0xFD, 0x44, 0x44);
+            // Reference full-stroke travel for the live % readout and depth tint
+            // (magnetic switches: ~4.0 mm nominal total travel).
+            const FULL_TRAVEL_MM: f32 = 4.0;
+            // Travel display decimals: driver `travelPrecision` getter.
+            let digits = app.travel_digits;
+            let scale_mm = app.info.scale.max(1);
+            let of_slot = |raw: &[u16], slot: Option<usize>| -> Option<f32> {
+                let r = *raw.get(slot?)?;
+                (r != 0).then(|| proto::raw_to_mm(r, scale_mm))
+            };
+            let calibration_mode = app.calibration.overlay_visible();
+            let mut hover_info: Option<String> = None;
+            for (lid, hid, x, y, w, hgt, label) in layout::KEYS {
+                // Keys grow slightly INTO the inter-key gaps (asset pitch 46 vs the
+                // 40-wide unit keys) so each key reads bigger without changing the
+                // layout geometry; the fitted text sizes keep every row separated.
+                let inf = 1.7 * k;
+                let rect = egui::Rect::from_min_max(
+                    resp.rect.min + egui::Vec2::new(ox + x * k - inf, oy + y * k - inf),
+                    resp.rect.min
+                        + egui::Vec2::new(ox + (x + w) * k + inf, oy + (y + hgt) * k + inf),
                 );
-            }
-        }
-        // (The driver's switch-number corner badge stays off per request:
-        // the legend below already maps fill colors to switch types.)
-        // Layered key card: ORIGINAL cap on top (muted), a spacer band, the
-        // CURRENT binding under it, then the live depth row in its own band
-        // and finally the red/blue press/release travels at the very bottom
-        // (the driver template position). Rows are stacked from bounded
-        // band heights, so rows can no longer collide; all base fonts stay
-        // a step smaller per earlier request while the card itself grew.
-        let text_col = text_on(fill);
-        // Arrow keys render the Nerd-Font glyph again (user preference over
-        // the vector polygons: the real icon matches the modified-key text,
-        // `load_nerd_font` puts it on the font stack at startup) and the
-        // binding always draws in its own row beneath.
-        let orig: &str = matrix::arrow_glyph(hid).unwrap_or(label);
-        let bind_txt = binding.replace(" + ", "+");
-        // Live depth (op 254) as mm + percent of the full stroke.
-        let live_pct = ((mm / FULL_TRAVEL_MM * 100.0).round() as i32).clamp(0, 100);
-        let has_live = mm > 0.0005;
-        let live_txt = if has_live {
-            format!("{mm:.digits$}mm {live_pct}%")
-        } else {
-            String::new()
-        };
-        let fit = |txt: &str, size: f32| {
-            painter
-                .layout_no_wrap(txt.to_owned(), egui::FontId::proportional(size), text_col)
-                .rect
-                .width()
-        };
-        let fit_font = |txt: &str, base: f32, zone: f32| -> f32 {
-            if txt.is_empty() || zone <= 2.0 {
-                return base;
-            }
-            let w0 = fit(txt, base);
-            if w0 <= zone || base <= 3.0 {
-                base
-            } else {
-                (base * zone / w0).max(3.0)
-            }
-        };
-        // Base fonts: one notch smaller everywhere (orig/binding 9.2k, live
-        // 6.2k); the driver pe() rule stays untouched for the red/blue row.
-        let fbase = 9.2 * k;
-        let of0 = fit_font(orig, fbase, (rect.width() - 8.0 * k).max(2.0));
-        let bf0 = fit_font(&bind_txt, fbase, (rect.width() - 7.0 * k).max(2.0));
-        let travel_font0 = (8.0 * k * 4.0 / (digits.max(1) as f32 + 2.0)).max(3.0);
-        let has_trav =
-            of_slot(&app.travel_press, slot).is_some() || of_slot(&app.travel_lift, slot).is_some();
-        let lf0 = fit_font(&live_txt, 6.2 * k, (rect.width() - 6.0 * k).max(2.0));
-        let h_live = if has_live { lf0 * 1.28 } else { 0.0 };
-        let h_press = if has_trav { travel_font0 * 1.32 } else { 0.0 };
-        // Vertical bands (round 16): red/blue travels return to the very
-        // bottom (the driver template position); the live depth row gets
-        // its own band directly above them so the travel distances no
-        // longer drift upward; orig/binding share the top text zone.
-        let bot = rect.bottom() - 1.0 * k;
-        let press_bot = bot;
-        let live_bot = press_bot - if has_trav { h_press + 0.7 * k } else { 0.0 };
-        let text_bot = live_bot - if has_live { h_live + 0.7 * k } else { 0.0 };
-        let top = rect.top() + 1.6 * k;
-        let zone_h = (text_bot - top).max(1.0);
-        let h_orig = if orig.is_empty() { 0.0 } else { of0 * 1.2 };
-        let h_bind = if bind_txt.is_empty() { 0.0 } else { bf0 * 1.2 };
-        // Spacer band between the original cap and the modified binding
-        // (per request): keeps the two rows reading as separate lines.
-        let h_gap = if orig.is_empty() || bind_txt.is_empty() {
-            0.0
-        } else {
-            1.3 * k
-        };
-        // Fit the [orig, gap, bind] stack into the text zone; shrink both
-        // fonts proportionally if the pair is too tall.
-        let stack_fit = (zone_h / (h_orig + h_gap + h_bind + 0.3 * k).max(1.0))
-            .min(1.0)
-            .max(0.4);
-        let (of, bf) = (of0 * stack_fit, bf0 * stack_fit);
-        let (h_orig, h_bind, h_gapf) = (h_orig * stack_fit, h_bind * stack_fit, h_gap * stack_fit);
-        let (orig_cy, bind_cy) = if bind_txt.is_empty() {
-            // Free key: center the original inside the whole text zone.
-            (top + (zone_h - h_orig) / 2.0 + h_orig / 2.0, 0.0)
-        } else {
-            (
-                top + h_orig / 2.0,
-                top + h_orig + h_gapf + h_bind / 2.0,
-            )
-        };
-        if h_orig > 0.0 {
-            painter.text(
-                egui::pos2(rect.center().x, orig_cy),
-                egui::Align2::CENTER_CENTER,
-                orig,
-                egui::FontId::proportional(of),
+                let slot = layout::slot_for(hid, mat);
+                // Calibration takes over the board overlay; normal live-depth
+                // tint/glow is suppressed so the original cyan/green fill is clear.
+                let calib_overlay = if calibration_mode {
+                    slot.and_then(|s| app.calibration.overlay_for(s))
+                } else {
+                    None
+                };
+                let mm = if calibration_mode {
+                    0.0
+                } else {
+                    slot.and_then(|s| live.get(&s).copied()).unwrap_or(0.0)
+                };
+                let depth = (mm / FULL_TRAVEL_MM).clamp(0.0, 1.0);
+                let selected = slot
+                    .and_then(|s| {
+                        app.remap_entries
+                            .iter()
+                            .position(|e| e.slot == s)
+                            .map(|i| Some(i) == app.remap_selected)
+                    })
+                    .unwrap_or(false);
+                let binding = slot
+                    .and_then(|s| {
+                        app.remap_entries
+                            .iter()
+                            .find(|e| e.slot == s)
+                            .map(|e| e.binding.short_label())
+                    })
+                    .unwrap_or_default();
+                let sw_code = slot
+                    .and_then(|s| app.switch_codes.get(s).copied())
+                    .unwrap_or(0xFF);
+                let [sr, sg, sb] = switches::switch_color(sw_code);
+                // Live-input activation: once the current depth reaches the key's
+                // configured press-travel activation point, the fill turns black
+                // (auto-contrast text goes white) and a layered red glow radiates
+                // around the key so the actuation moment is unmistakable.
+                let act_mm = of_slot(&app.travel_press, slot);
+                let activated = mm > 0.0005 && act_mm.is_some_and(|a| mm >= a);
+                // Key fill = the selected switch's driver color; live press depth
+                // lightens it (kept aesthetic on the dark panel).
+                let lit = |c: u8| (c as f32 + (255.0 - c as f32) * depth * 0.55).round() as u8;
+                let fill = if activated {
+                    egui::Color32::from_rgb(0x0D, 0x0D, 0x0D)
+                } else {
+                    egui::Color32::from_rgb(lit(sr), lit(sg), lit(sb))
+                };
+                let round = egui::CornerRadius {
+                    nw: (5.0 * k) as u8,
+                    ne: (5.0 * k) as u8,
+                    sw: (5.0 * k) as u8,
+                    se: (5.0 * k) as u8,
+                };
+                painter.rect_filled(rect, round, fill);
+                // Activation glow: layered outer strokes (driver activation red,
+                // alpha decaying outward) around the active key.
                 if activated {
-                    text_col
-                } else {
-                    text_col.gamma_multiply(0.82)
-                },
-            );
-        }
-        if h_bind > 0.0 {
-            painter.text(
-                egui::pos2(rect.center().x, bind_cy),
-                egui::Align2::CENTER_CENTER,
-                &bind_txt,
-                egui::FontId::proportional(bf),
-                text_col,
-            );
-        }
-        // Live depth band, above the travel row (current travel in mm + %).
-        if has_live {
-            painter.text(
-                egui::pos2(rect.center().x, live_bot),
-                egui::Align2::CENTER_BOTTOM,
-                &live_txt,
-                egui::FontId::proportional(lf0),
-                text_col,
-            );
-        }
-        // Activation travels in the template's exact anchors/roles
-        // (`d9f04973.js he/pe/ve` + `2a8cd9c4.js` template): press bottom-left
-        // at x+3/y=39.5 (#FE4545), lift anchored at x=22 of the 42-unit box —
-        // i.e. `right - 20k` so wide keys glue it to their right edge
-        // (#0066FF). `pe()` shrinks the font as digits grow
-        // (`8 * 4 / (precision+2)`), and we add a per-key fit guard that
-        // shrinks both numbers until they fit side by side inside this key's
-        // own width (the browser font was narrower than ours at small sizes —
-        // that's why values overlapped before).
-        let press = of_slot(&app.travel_press, slot);
-        let lift = of_slot(&app.travel_lift, slot);
-        if press.is_some() || lift.is_some() {
-            let fmt = |t: Option<f32>| match t {
-                Some(v) => format!("{v:.digits$}"),
-                None => String::new(),
-            };
-            let (pt, lt) = (fmt(press), fmt(lift));
-            // Disjoint per-key zones — the numbers can never overlap because
-            // each shrinks only within its own span: press in
-            // [left+3k, lift-anchor) and lift in (lift-anchor, right-2k];
-            // when a value is alone its zone widens to the inner box. That
-            // plus `pe()`'s 8*4/(precision+2) font rule keeps every key
-            // readable at any window scale.
-            let into = |txt: &str, zone: f32, font: f32| -> f32 {
-                if txt.is_empty() || zone <= 2.0 {
-                    return font;
+                    for (grow, alpha) in [
+                        (0.0_f32, 0.65_f32),
+                        (2.4, 0.45),
+                        (4.8, 0.28),
+                        (7.2, 0.16),
+                        (9.6, 0.08),
+                    ] {
+                        let r = (5.0 * k + grow * k) as u8;
+                        painter.rect_stroke(
+                            rect.expand2(egui::Vec2::splat(grow * k)),
+                            egui::CornerRadius {
+                                nw: r,
+                                ne: r,
+                                sw: r,
+                                se: r,
+                            },
+                            egui::Stroke::new(2.0 * k, PRESS_COL.gamma_multiply(alpha)),
+                            egui::StrokeKind::Outside,
+                        );
+                    }
                 }
-                let w0 = fit(txt, font);
-                if w0 <= zone || font <= 3.0 {
-                    font
-                } else {
-                    (font * zone / w0).max(3.0)
+                // Travel-calibration overlay, exactly like `mj` in
+                // `index.5627ed60.js`: translucent cyan from the bottom, full height
+                // and 0.8 opacity once the raw value reaches the firmware threshold.
+                // Calibrated keys keep that full lock after release.
+                if let Some((locked, level)) = calib_overlay {
+                    if level > 0.0 {
+                        let overlay_top = rect.bottom() - rect.height() * level;
+                        let overlay_rect = egui::Rect::from_min_max(
+                            egui::pos2(rect.left(), overlay_top),
+                            rect.max,
+                        );
+                        let overlay_round = if level >= 1.0 {
+                            round
+                        } else {
+                            egui::CornerRadius {
+                                nw: 0,
+                                ne: 0,
+                                sw: round.sw,
+                                se: round.se,
+                            }
+                        };
+                        let alpha = if locked { 204 } else { 77 }; // 0.8 / 0.3
+                        painter.rect_filled(
+                            overlay_rect,
+                            overlay_round,
+                            egui::Color32::from_rgba_unmultiplied(0x74, 0xEB, 0xD5, alpha),
+                        );
+                        if locked {
+                            painter.rect_stroke(
+                                rect,
+                                round,
+                                egui::Stroke::new(
+                                    1.5 * k,
+                                    egui::Color32::from_rgb(0x2B, 0xC7, 0x8A),
+                                ),
+                                egui::StrokeKind::Inside,
+                            );
+                        }
+                    }
                 }
-            };
-            let press_zone = if lift.is_some() {
-                (rect.width() - 23.0 * k - 1.5 * k).max(2.0)
-            } else {
-                (rect.width() - 5.0 * k).max(2.0)
-            };
-            let lift_zone = if press.is_some() {
-                (18.0 * k).max(2.0)
-            } else {
-                (rect.width() - 22.0 * k).max(2.0)
-            };
-            let (tfp, tfl) = (
-                into(&pt, press_zone, travel_font0),
-                into(&lt, lift_zone, travel_font0),
-            );
-            if let Some(t) = press {
-                painter.text(
-                    egui::pos2(rect.left() + 3.0 * k, press_bot),
-                    egui::Align2::LEFT_BOTTOM,
-                    format!("{t:.digits$}"),
-                    egui::FontId::proportional(tfp),
-                    PRESS_COL,
-                );
-            }
-            if let Some(t) = lift {
-                painter.text(
-                    egui::pos2(rect.right() - 20.0 * k, press_bot),
-                    egui::Align2::LEFT_BOTTOM,
-                    format!("{t:.digits$}"),
-                    egui::FontId::proportional(tfl),
-                    LIFT_COL,
-                );
-            }
-        }
-        if selected {
-            painter.rect_stroke(
-                rect,
-                round,
-                egui::Stroke::new(2.0_f32, SELECT_COL),
-                egui::StrokeKind::Outside,
-            );
-        }
-        if resp.hovered() {
-            if let Some(p) = resp.interact_pointer_pos() {
-                if rect.contains(p) {
+                // (The driver's switch-number corner badge stays off per request:
+                // the legend below already maps fill colors to switch types.)
+                // Layered key card: ORIGINAL cap on top (muted), a spacer band, the
+                // CURRENT binding under it, then the live depth row in its own band
+                // and finally the red/blue press/release travels at the very bottom
+                // (the driver template position). Rows are stacked from bounded
+                // band heights, so rows can no longer collide; all base fonts stay
+                // a step smaller per earlier request while the card itself grew.
+                let text_col = text_on(fill);
+                // Arrow keys render the Nerd-Font glyph again (user preference over
+                // the vector polygons: the real icon matches the modified-key text,
+                // `load_nerd_font` puts it on the font stack at startup) and the
+                // binding always draws in its own row beneath.
+                let orig: &str = matrix::arrow_glyph(hid).unwrap_or(label);
+                let bind_txt = binding.replace(" + ", "+");
+                // Live depth (op 254) as mm + percent of the full stroke.
+                let live_pct = ((mm / FULL_TRAVEL_MM * 100.0).round() as i32).clamp(0, 100);
+                let has_live = mm > 0.0005;
+                let live_txt = if has_live {
+                    format!("{mm:.digits$}mm {live_pct}%")
+                } else {
+                    String::new()
+                };
+                let fit = |txt: &str, size: f32| {
+                    painter
+                        .layout_no_wrap(txt.to_owned(), egui::FontId::proportional(size), text_col)
+                        .rect
+                        .width()
+                };
+                let fit_font = |txt: &str, base: f32, zone: f32| -> f32 {
+                    if txt.is_empty() || zone <= 2.0 {
+                        return base;
+                    }
+                    let w0 = fit(txt, base);
+                    if w0 <= zone || base <= 3.0 {
+                        base
+                    } else {
+                        (base * zone / w0).max(3.0)
+                    }
+                };
+                // Base fonts: one notch smaller everywhere (orig/binding 9.2k, live
+                // 6.2k); the driver pe() rule stays untouched for the red/blue row.
+                let fbase = 9.2 * k;
+                let of0 = fit_font(orig, fbase, (rect.width() - 8.0 * k).max(2.0));
+                let bf0 = fit_font(&bind_txt, fbase, (rect.width() - 7.0 * k).max(2.0));
+                let travel_font0 = (8.0 * k * 4.0 / (digits.max(1) as f32 + 2.0)).max(3.0);
+                let has_trav = of_slot(&app.travel_press, slot).is_some()
+                    || of_slot(&app.travel_lift, slot).is_some();
+                let lf0 = fit_font(&live_txt, 6.2 * k, (rect.width() - 6.0 * k).max(2.0));
+                let h_live = if has_live { lf0 * 1.28 } else { 0.0 };
+                let h_press = if has_trav { travel_font0 * 1.32 } else { 0.0 };
+                // Vertical bands (round 16): red/blue travels return to the very
+                // bottom (the driver template position); the live depth row gets
+                // its own band directly above them so the travel distances no
+                // longer drift upward; orig/binding share the top text zone.
+                let bot = rect.bottom() - 1.0 * k;
+                let press_bot = bot;
+                let live_bot = press_bot - if has_trav { h_press + 0.7 * k } else { 0.0 };
+                let text_bot = live_bot - if has_live { h_live + 0.7 * k } else { 0.0 };
+                let top = rect.top() + 1.6 * k;
+                let zone_h = (text_bot - top).max(1.0);
+                let h_orig = if orig.is_empty() { 0.0 } else { of0 * 1.2 };
+                let h_bind = if bind_txt.is_empty() { 0.0 } else { bf0 * 1.2 };
+                // Spacer band between the original cap and the modified binding
+                // (per request): keeps the two rows reading as separate lines.
+                let h_gap = if orig.is_empty() || bind_txt.is_empty() {
+                    0.0
+                } else {
+                    1.3 * k
+                };
+                // Fit the [orig, gap, bind] stack into the text zone; shrink both
+                // fonts proportionally if the pair is too tall.
+                let stack_fit = (zone_h / (h_orig + h_gap + h_bind + 0.3 * k).max(1.0))
+                    .min(1.0)
+                    .max(0.4);
+                let (of, bf) = (of0 * stack_fit, bf0 * stack_fit);
+                let (h_orig, h_bind, h_gapf) =
+                    (h_orig * stack_fit, h_bind * stack_fit, h_gap * stack_fit);
+                let (orig_cy, bind_cy) = if bind_txt.is_empty() {
+                    // Free key: center the original inside the whole text zone.
+                    (top + (zone_h - h_orig) / 2.0 + h_orig / 2.0, 0.0)
+                } else {
+                    (top + h_orig / 2.0, top + h_orig + h_gapf + h_bind / 2.0)
+                };
+                if h_orig > 0.0 {
+                    painter.text(
+                        egui::pos2(rect.center().x, orig_cy),
+                        egui::Align2::CENTER_CENTER,
+                        orig,
+                        egui::FontId::proportional(of),
+                        if activated {
+                            text_col
+                        } else {
+                            text_col.gamma_multiply(0.82)
+                        },
+                    );
+                }
+                if h_bind > 0.0 {
+                    painter.text(
+                        egui::pos2(rect.center().x, bind_cy),
+                        egui::Align2::CENTER_CENTER,
+                        &bind_txt,
+                        egui::FontId::proportional(bf),
+                        text_col,
+                    );
+                }
+                // Live depth band, above the travel row (current travel in mm + %).
+                if has_live {
+                    painter.text(
+                        egui::pos2(rect.center().x, live_bot),
+                        egui::Align2::CENTER_BOTTOM,
+                        &live_txt,
+                        egui::FontId::proportional(lf0),
+                        text_col,
+                    );
+                }
+                // Activation travels in the template's exact anchors/roles
+                // (`d9f04973.js he/pe/ve` + `2a8cd9c4.js` template): press bottom-left
+                // at x+3/y=39.5 (#FE4545), lift anchored at x=22 of the 42-unit box —
+                // i.e. `right - 20k` so wide keys glue it to their right edge
+                // (#0066FF). `pe()` shrinks the font as digits grow
+                // (`8 * 4 / (precision+2)`), and we add a per-key fit guard that
+                // shrinks both numbers until they fit side by side inside this key's
+                // own width (the browser font was narrower than ours at small sizes —
+                // that's why values overlapped before).
+                let press = of_slot(&app.travel_press, slot);
+                let lift = of_slot(&app.travel_lift, slot);
+                if press.is_some() || lift.is_some() {
                     let fmt = |t: Option<f32>| match t {
                         Some(v) => format!("{v:.digits$}"),
-                        None => String::from("-"),
+                        None => String::new(),
                     };
-                    hover_info = Some(format!(
+                    let (pt, lt) = (fmt(press), fmt(lift));
+                    // Disjoint per-key zones — the numbers can never overlap because
+                    // each shrinks only within its own span: press in
+                    // [left+3k, lift-anchor) and lift in (lift-anchor, right-2k];
+                    // when a value is alone its zone widens to the inner box. That
+                    // plus `pe()`'s 8*4/(precision+2) font rule keeps every key
+                    // readable at any window scale.
+                    let into = |txt: &str, zone: f32, font: f32| -> f32 {
+                        if txt.is_empty() || zone <= 2.0 {
+                            return font;
+                        }
+                        let w0 = fit(txt, font);
+                        if w0 <= zone || font <= 3.0 {
+                            font
+                        } else {
+                            (font * zone / w0).max(3.0)
+                        }
+                    };
+                    let press_zone = if lift.is_some() {
+                        (rect.width() - 23.0 * k - 1.5 * k).max(2.0)
+                    } else {
+                        (rect.width() - 5.0 * k).max(2.0)
+                    };
+                    let lift_zone = if press.is_some() {
+                        (18.0 * k).max(2.0)
+                    } else {
+                        (rect.width() - 22.0 * k).max(2.0)
+                    };
+                    let (tfp, tfl) = (
+                        into(&pt, press_zone, travel_font0),
+                        into(&lt, lift_zone, travel_font0),
+                    );
+                    if let Some(t) = press {
+                        painter.text(
+                            egui::pos2(rect.left() + 3.0 * k, press_bot),
+                            egui::Align2::LEFT_BOTTOM,
+                            format!("{t:.digits$}"),
+                            egui::FontId::proportional(tfp),
+                            PRESS_COL,
+                        );
+                    }
+                    if let Some(t) = lift {
+                        painter.text(
+                            egui::pos2(rect.right() - 20.0 * k, press_bot),
+                            egui::Align2::LEFT_BOTTOM,
+                            format!("{t:.digits$}"),
+                            egui::FontId::proportional(tfl),
+                            LIFT_COL,
+                        );
+                    }
+                }
+                if selected {
+                    painter.rect_stroke(
+                        rect,
+                        round,
+                        egui::Stroke::new(2.0_f32, SELECT_COL),
+                        egui::StrokeKind::Outside,
+                    );
+                }
+                if resp.hovered() {
+                    if let Some(p) = resp.interact_pointer_pos() {
+                        if rect.contains(p) {
+                            let fmt = |t: Option<f32>| match t {
+                                Some(v) => format!("{v:.digits$}"),
+                                None => String::from("-"),
+                            };
+                            let calibration_txt = if calibration_mode {
+                                slot.map(|s| {
+                                    let raw = app.calibration.raw.get(s).copied().unwrap_or(0);
+                                    let locked =
+                                        app.calibration.calibrated.get(s).copied().unwrap_or(false);
+                                    format!(
+                                        "\nCalibration: raw {raw} / threshold {} ({})",
+                                        app.calibration.threshold,
+                                        if locked { "locked" } else { "not locked" }
+                                    )
+                                })
+                                .unwrap_or_default()
+                            } else {
+                                String::new()
+                            };
+                            hover_info =
+                                Some(format!(
                         "{label} (slot {}, {})\nBinding: {}\nPress {} mm \u{2022} Release \
-                         {} mm \u{2022} Live {mm:.digits$} mm ({live_pct}%)",
+                         {} mm \u{2022} Live {mm:.digits$} mm ({live_pct}%){calibration_txt}",
                         slot.map(|s| s.to_string()).unwrap_or_else(|| "-".into()),
                         switches::switch_display(sw_code),
                         if binding.is_empty() { "default" } else { &binding },
                         fmt(of_slot(&app.travel_press, slot)),
                         fmt(of_slot(&app.travel_lift, slot)),
                     ));
+                        }
+                    }
+                }
+                if resp.clicked()
+                    && rect.contains(resp.interact_pointer_pos().unwrap_or(egui::Pos2::ZERO))
+                {
+                    if let Some(s) = slot {
+                        if let Some(i) = app.remap_entries.iter().position(|e| e.slot == s) {
+                            select_entry(app, i);
+                        }
+                    }
+                    let _ = lid;
                 }
             }
-        }
-        if resp.clicked() && rect.contains(resp.interact_pointer_pos().unwrap_or(egui::Pos2::ZERO)) {
-            if let Some(s) = slot {
-                if let Some(i) = app.remap_entries.iter().position(|e| e.slot == s) {
-                    select_entry(app, i);
-                }
+            if let Some(info) = hover_info {
+                resp.on_hover_text(info);
             }
-            let _ = lid;
-        }
-    }
-    if let Some(info) = hover_info {
-        resp.on_hover_text(info);
-    }
-    // Live legend: switch colors (driver 轴体颜色字典) + travel value colors.
-    ui.horizontal_wrapped(|ui| {
-        for ((_, label), [r, g, b]) in switches::SK75_SWITCHES
-            .iter()
-            .zip(switches::SK75_SWITCH_COLORS.iter())
-        {
-            ui.label(
-                egui::RichText::new("■ ")
-                    .color(egui::Color32::from_rgb(*r, *g, *b))
-                    .small(),
-            );
-            ui.label(egui::RichText::new(*label).small());
-        }
-    });
-    ui.horizontal(|ui| {
-        ui.label(egui::RichText::new("■ ").color(PRESS_COL).small());
-        ui.label(egui::RichText::new("press activation").small());
-        ui.label(egui::RichText::new("■ ").color(LIFT_COL).small());
-        ui.label(egui::RichText::new("release activation").small());
-        ui.label(
-            egui::RichText::new("live % = of the 4.0 mm full stroke")
-                .weak()
-                .small(),
-        );
-        ui.label(
-            egui::RichText::new("(key fill color = switch type, in this order)").weak(),
-        );
+            // Live legend: switch colors (driver 轴体颜色字典) + travel value colors.
+            ui.horizontal_wrapped(|ui| {
+                for ((_, label), [r, g, b]) in switches::SK75_SWITCHES
+                    .iter()
+                    .zip(switches::SK75_SWITCH_COLORS.iter())
+                {
+                    ui.label(
+                        egui::RichText::new("■ ")
+                            .color(egui::Color32::from_rgb(*r, *g, *b))
+                            .small(),
+                    );
+                    ui.label(egui::RichText::new(*label).small());
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("■ ").color(PRESS_COL).small());
+                ui.label(egui::RichText::new("press activation").small());
+                ui.label(egui::RichText::new("■ ").color(LIFT_COL).small());
+                ui.label(egui::RichText::new("release activation").small());
+                ui.label(
+                    egui::RichText::new("live % = of the 4.0 mm full stroke")
+                        .weak()
+                        .small(),
+                );
+                ui.label(
+                    egui::RichText::new("(key fill color = switch type, in this order)").weak(),
+                );
+            });
+        });
     });
     ui.separator();
     binding_editor(ui, app);
@@ -1264,40 +1766,40 @@ fn binding_editor(ui: &mut egui::Ui, app: &mut App) {
                     }
                 ));
             });
-            egui::ScrollArea::vertical().max_height(160.0).show(ui, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    for h in keymap::STANDARD_KEYS {
-                        let picked = app.remap_combo.contains(&h);
-                        let label = matrix::arrow_glyph(h)
-                            .map(str::to_string)
-                            .unwrap_or_else(|| matrix::hid_name(h));
-                        if ui
-                            .selectable_label(picked, label)
-                            .on_hover_text(matrix::hid_name(h))
-                            .clicked()
-                        {
-                            // Toggle on click, capped at the driver limit —
-                            // mirrors `handleClick_组合键` (`length>=3` return).
-                            // New picks fill key, then key2, then skey.
-                            if let Some(pos) =
-                                app.remap_combo.iter().position(|x| *x == h)
+            egui::ScrollArea::vertical()
+                .max_height(160.0)
+                .show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        for h in keymap::STANDARD_KEYS {
+                            let picked = app.remap_combo.contains(&h);
+                            let label = matrix::arrow_glyph(h)
+                                .map(str::to_string)
+                                .unwrap_or_else(|| matrix::hid_name(h));
+                            if ui
+                                .selectable_label(picked, label)
+                                .on_hover_text(matrix::hid_name(h))
+                                .clicked()
                             {
-                                app.remap_combo[pos] = 0;
-                            } else if let Some(slot) = [1usize, 2, 0]
-                                .into_iter()
-                                .find(|i| app.remap_combo[*i] == 0)
-                            {
-                                app.remap_combo[slot] = h;
-                            } else {
-                                app.remap_msg = format!(
-                                    "Combo holds at most {} keys (driver limit).",
-                                    keymap::MAX_COMBO_KEYS
-                                );
+                                // Toggle on click, capped at the driver limit —
+                                // mirrors `handleClick_组合键` (`length>=3` return).
+                                // New picks fill key, then key2, then skey.
+                                if let Some(pos) = app.remap_combo.iter().position(|x| *x == h) {
+                                    app.remap_combo[pos] = 0;
+                                } else if let Some(slot) = [1usize, 2, 0]
+                                    .into_iter()
+                                    .find(|i| app.remap_combo[*i] == 0)
+                                {
+                                    app.remap_combo[slot] = h;
+                                } else {
+                                    app.remap_msg = format!(
+                                        "Combo holds at most {} keys (driver limit).",
+                                        keymap::MAX_COMBO_KEYS
+                                    );
+                                }
                             }
                         }
-                    }
+                    });
                 });
-            });
         }
     }
     let current_code = app.switch_codes.get(entry.slot).copied().unwrap_or(0);
@@ -1341,44 +1843,241 @@ fn binding_editor(ui: &mut egui::Ui, app: &mut App) {
     }
 }
 
-fn calibration_tab(ui: &mut egui::Ui, app: &mut App) {
-    ui.heading("Travel calibration");
-    ui.label("Same sequence as the original driver: min-cal on → 2 s → min-cal off → max-cal on. Keep hands off the switches and stay wired.");
-    if ui
-        .add_enabled(!app.cal_busy, egui::Button::new("Start calibration"))
-        .clicked()
-    {
-        app.cal_busy = true;
-        app.cal_msg = String::from("Running min/max calibration…");
-        match hid::open_sk75(app.vid, app.pid, app.path_opt(), None) {
-            Ok(dev) => match dev.calibrate_start() {
-                Ok(()) => {
-                    app.cal_msg = String::from(
-                        "Max-cal armed. Wait ~8 s untouched, then press “Finish”.",
+/// The calibration option to the left of the board. It is the entry point
+/// for the original guide/start flow, and then shows live per-key progress.
+fn calibration_panel(ui: &mut egui::Ui, app: &mut App) {
+    ui.vertical(|ui| {
+    ui.set_width(200.0);
+    ui.set_max_width(200.0);
+    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+    egui::Frame::group(ui.style())
+        .inner_margin(egui::Margin::same(10))
+        .show(ui, |ui| {
+            ui.heading("Travel Calibration");
+            ui.add_space(4.0);
+            match app.calibration.phase {
+                CalibrationPhase::Idle => {
+                    ui.label(
+                        "Press every key once to record its full travel. Reaching the threshold locks that key at 100%.",
                     );
+                    ui.add_space(6.0);
+                    if ui.button("Travel Calibration").clicked() {
+                        app.begin_travel_calibration();
+                    }
+                    if !app.calibration.message.is_empty() {
+                        ui.small(&app.calibration.message);
+                    }
                 }
-                Err(e) => {
-                    app.cal_msg = format!("Calibration failed: {e:#}");
-                    app.cal_busy = false;
+                CalibrationPhase::StartingMin | CalibrationPhase::Settling => {
+                    ui.add_enabled(
+                        false,
+                        egui::Button::new("Starting calibration, please wait..."),
+                    );
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.small("Do not unplug the keyboard.");
+                    });
+                    ui.label(&app.calibration.message);
                 }
-            },
-            Err(e) => {
-                app.cal_msg = format!("{e:#}");
-                app.cal_busy = false;
+                CalibrationPhase::Ready => {
+                    ui.label("Min/max calibration is armed.");
+                    if app.calibration.guide_open {
+                        ui.small("Use Start Calibration in the guide.");
+                    } else if ui.button("Open operation guide").clicked() {
+                        app.calibration.guide_open = true;
+                    }
+                    ui.small(&app.calibration.message);
+                }
+                CalibrationPhase::Active => {
+                    let done = app.calibration.calibrated_count();
+                    let total = app.calibration.expected.len();
+                    ui.label(format!("{done} / {total} keys calibrated"));
+                    ui.add(
+                        egui::ProgressBar::new(if total == 0 {
+                            0.0
+                        } else {
+                            done as f32 / total as f32
+                        })
+                        .show_percentage(),
+                    );
+                    ui.add_space(4.0);
+                    let all_done = app.calibration.all_done();
+                    let finish_resp = ui
+                        .add_enabled(all_done, egui::Button::new("Finish calibration"))
+                        .on_hover_text("Turn max-cal off after every key has locked");
+                    if finish_resp.clicked() {
+                        app.finish_travel_calibration();
+                    }
+                    if ui.button("Cancel calibration").clicked() {
+                        app.cancel_travel_calibration();
+                    }
+                    ui.small(&app.calibration.message);
+                }
+                CalibrationPhase::Complete => {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(0x2B, 0xC7, 0x8A),
+                        "Calibration Complete",
+                    );
+                    let total = app.calibration.expected.len();
+                    ui.label(format!(
+                        "{total} / {total} keys are locked at full travel."
+                    ));
+                    ui.add_space(4.0);
+                    if ui.button("Calibrate again").clicked() {
+                        app.begin_travel_calibration();
+                    }
+                    ui.small(&app.calibration.message);
+                }
+                CalibrationPhase::Failed => {
+                    ui.colored_label(egui::Color32::from_rgb(0xFE, 0x45, 0x45), "Calibration failed");
+                    ui.label(&app.calibration.message);
+                    ui.add_space(4.0);
+                    if ui.button("Try again").clicked() {
+                        app.begin_travel_calibration();
+                    }
+                }
             }
-        }
+        });
+    });
+}
+
+/// Original guide modal (`rre` in `index.5627ed60.js`), in English. The
+/// startup sequence runs while the guide is open; Start is disabled until
+/// the driver would enter `ing_调用中`.
+fn calibration_guide(ctx: &egui::Context, app: &mut App) {
+    if !app.calibration.guide_open {
+        return;
     }
-    if app.cal_busy && ui.button("Finish (max-cal off)").clicked() {
-        match hid::open_sk75(app.vid, app.pid, app.path_opt(), None) {
-            Ok(dev) => match dev.calibrate_stop() {
-                Ok(()) => app.cal_msg = String::from("Calibration finished. Re-read analog to verify rest ≈ 0."),
-                Err(e) => app.cal_msg = format!("Finish failed: {e:#}"),
-            },
-            Err(e) => app.cal_msg = format!("{e:#}"),
-        }
-        app.cal_busy = false;
+    egui::Window::new("Keystroke Calibration Operation Guide")
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+        .default_width(560.0)
+        .show(ctx, |ui| {
+            ui.set_max_width(560.0);
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+            ui.label(
+                "Please press each key lightly and stay at least 1 second. When the key turns green, the key calibration is complete. Do not miss the key and press it again. Wireless does not support the number of key calibrations.",
+            );
+            ui.add_space(6.0);
+            ui.label(
+                "Calibration is running. Keep the keyboard wired and do not unplug the cable until calibration is complete.",
+            );
+            ui.label(format!(
+                "The Finish button is enabled after all {} keys have locked at full travel.",
+                app.calibration.expected.len()
+            ));
+            ui.separator();
+            ui.horizontal(|ui| match app.calibration.phase {
+                CalibrationPhase::StartingMin | CalibrationPhase::Settling => {
+                    ui.add_enabled(
+                        false,
+                        egui::Button::new("Starting calibration, please wait..."),
+                    );
+                    ui.spinner();
+                    if ui.button("Cancel").clicked() {
+                        app.cancel_travel_calibration();
+                    }
+                }
+                CalibrationPhase::Ready => {
+                    if ui.button("Start Calibration").clicked() {
+                        app.start_calibration_preview();
+                    }
+                    if ui.button("Cancel").clicked() {
+                        app.cancel_travel_calibration();
+                    }
+                }
+                CalibrationPhase::Failed => {
+                    ui.label(&app.calibration.message);
+                    if ui.button("Close").clicked() {
+                        app.calibration.guide_open = false;
+                    }
+                }
+                _ => {
+                    if ui.button("Close").clicked() {
+                        app.calibration.guide_open = false;
+                    }
+                }
+            });
+        });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn active_session(threshold: u16, expected: Vec<usize>) -> CalibrationSession {
+        let mut c = CalibrationSession::idle();
+        c.phase = CalibrationPhase::Active;
+        c.threshold = threshold;
+        c.expected = expected;
+        c
     }
-    ui.label(&app.cal_msg);
+
+    #[test]
+    fn calibration_locks_at_threshold_and_stays_locked() {
+        let mut c = active_session(300, vec![0]);
+        c.raw[0] = 299;
+        c.observe();
+        assert!(!c.calibrated[0]);
+        let (locked, level) = c.overlay_for(0).unwrap();
+        assert!(!locked);
+        assert!((level - 299.0 / 300.0).abs() < 1e-6);
+
+        c.raw[0] = 300;
+        c.observe();
+        assert!(c.calibrated[0]);
+        assert_eq!(c.overlay_for(0), Some((true, 1.0)));
+
+        // Releasing the key must not clear the locked full-travel overlay.
+        c.raw[0] = 0;
+        assert_eq!(c.overlay_for(0), Some((true, 1.0)));
+        c.observe();
+        assert!(c.calibrated[0]);
+    }
+
+    #[test]
+    fn calibration_uses_threshold_one_for_old_firmware() {
+        let mut c = active_session(1, vec![0]);
+        c.raw[0] = 1;
+        c.observe();
+        assert!(c.calibrated[0]);
+        assert_eq!(c.overlay_for(0), Some((true, 1.0)));
+    }
+
+    #[test]
+    fn calibration_requires_every_expected_key() {
+        let mut c = active_session(300, vec![0, 1]);
+        c.raw[0] = 400;
+        c.observe();
+        assert_eq!(c.calibrated_count(), 1);
+        assert!(!c.all_done());
+
+        c.raw[1] = 300;
+        c.observe();
+        assert_eq!(c.calibrated_count(), 2);
+        assert!(c.all_done());
+    }
+
+    #[test]
+    fn calibration_expected_keys_match_layout() {
+        assert_eq!(
+            layout::all_slots(&matrix::MATRIX_3804).len(),
+            81,
+            "host SK75 variant must require all 81 on-screen keys"
+        );
+    }
+
+    #[test]
+    fn calibration_overlay_is_hidden_outside_active_or_complete() {
+        let mut c = active_session(300, vec![0]);
+        c.raw[0] = 300;
+        c.observe();
+        c.phase = CalibrationPhase::Ready;
+        assert_eq!(c.overlay_for(0), None);
+        c.phase = CalibrationPhase::Complete;
+        assert_eq!(c.overlay_for(0), Some((true, 1.0)));
+    }
 }
 
 /// Load a system Nerd Font into egui so the arrow glyphs
@@ -1415,7 +2114,11 @@ fn install_nerd_font(ctx: &egui::Context) {
         visit(r, &mut cands);
     }
     cands.sort_by_key(|p| {
-        let n = p.file_name().and_then(|n| n.to_str()).unwrap_or("").to_lowercase();
+        let n = p
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_lowercase();
         (!n.contains("regular"), !n.contains("medium"), n.len())
     });
     let Some(path) = cands.into_iter().next() else {
@@ -1425,14 +2128,10 @@ fn install_nerd_font(ctx: &egui::Context) {
         return;
     };
     let mut fonts = egui::FontDefinitions::default();
-    fonts.font_data.insert(
-        "nerd".to_owned(),
-        egui::FontData::from_owned(bytes).into(),
-    );
-    for fam in [
-        egui::FontFamily::Proportional,
-        egui::FontFamily::Monospace,
-    ] {
+    fonts
+        .font_data
+        .insert("nerd".to_owned(), egui::FontData::from_owned(bytes).into());
+    for fam in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
         fonts
             .families
             .entry(fam)
@@ -1446,7 +2145,12 @@ fn main() -> eframe::Result<()> {
     env_logger::init();
     eframe::run_native(
         "SK75 TMR",
-        eframe::NativeOptions::default(),
+        eframe::NativeOptions {
+            viewport: egui::ViewportBuilder::default()
+                .with_inner_size([1280.0, 900.0])
+                .with_min_inner_size([900.0, 600.0]),
+            ..Default::default()
+        },
         Box::new(|cc| {
             install_nerd_font(&cc.egui_ctx);
             Ok(Box::new(App::new()))

@@ -43,18 +43,16 @@
 /// and `{id:3804,vid:12625,pid:20528,..."ry5088_womier_sk75he_europe_3m_8k_8k"}`.
 pub const VID_RONGYUAN: u16 = 0x3151; // 12625
 pub const PID_SK75_TMR: u16 = 0x5030; // 20528
-/// Known SK75 TMR firmware device IDs (whoAmI via cmd 143).
-pub const SK75_DEVICE_IDS: [u32; 2] = [2518, 3804];
 
 /// Vendor-control HID selector used by the old WebHID path (`Qf`):
 /// `{usage:2, usagePage:65535, interfaceNumber:2}` for pid 16391+ etc.
 /// Modern iot_manager path enumerates the same vendor page via
 /// `IotDeviceFilter{usage,usage_page}` + feature reports.
-pub const VENDOR_USAGE: u16 = 2;
 pub const VENDOR_USAGE_PAGE: u16 = 0xFFFF;
 
 /// Report-type selector (`ki` in index.js): NOT a HID report ID,
 /// selects where the checksum byte goes.
+#[allow(dead_code)] // Bit8/None are retained and exercised by protocol tests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum ReportKind {
@@ -110,6 +108,7 @@ pub mod mag_op {
     /// JS: `_getJiaoZhunXinXi` = `_getMulitMagnetismCMD(254,4,1,1)` + LE u16 decode.
     pub const LIVE_TRAVEL: u8 = 254; // live key-press travel value
     /// Live per-key dynamic analog value (u16 LE per matrix slot).
+    #[allow(dead_code)] // op 255 is documented but not shown in the current UI.
     pub const LIVE_DYNAMIC: u8 = 255; // live key-press dynamic value
     pub const AXIS_TYPE: u8 = 252; // switch (axis) type
     pub const TOP_DEADZONE: u8 = 251; // top dead zone
@@ -119,7 +118,7 @@ pub mod mag_op {
 /// JS `getPrecisionEnum` reads `FEA 230` response `[230, 0xAA, precision]`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Precision {
-    P001, // 0.01mm
+    P001,  // 0.01mm
     P0005, // 0.005mm
     P0001, // 0.001mm
 }
@@ -151,6 +150,20 @@ pub fn scale_from_version(usb: Option<u16>, rf: Option<u16>) -> u32 {
         Some(n) if n >= 768 && n < 1280 => 100,
         Some(n) if n >= 1280 => 200,
         _ => 10,
+    }
+}
+
+/// Per-key travel-calibration success threshold from the original UI
+/// (`mj` in `index.5627ed60.js`):
+/// `const y = version.rf ?? version.usb; const f = y && y < 768 ? 1 : 300;`.
+/// Versions below 768 report a different raw scale, so the driver uses 1;
+/// modern firmware uses 300 raw units (3.00 mm at scale 100).
+pub fn calibration_threshold(usb: Option<u16>, rf: Option<u16>) -> u16 {
+    let v = rf.or(usb).unwrap_or(0);
+    if v != 0 && v < 768 {
+        1
+    } else {
+        300
     }
 }
 
@@ -186,15 +199,10 @@ pub fn encode_cmd(mut buf: Vec<u8>, kind: ReportKind) -> Vec<u8> {
 /// Build `GET_MULTI_MAGNETISM` request: `[229, op, 1, page, 0,0,0,0]` + Bit7 checksum.
 /// JS `_getMulitMagnetismCMD(t,e)`: `s[0]=229,s[1]=t,s[2]=1,s[3]=page`.
 pub fn build_get_multi_magnetism(op: u8, page: u8) -> Vec<u8> {
-    encode_cmd(vec![cmd::GET_MULTI_MAGNETISM, op, 1, page, 0, 0, 0, 0], ReportKind::Bit7)
-}
-
-/// Build `SET_MULTI_MAGNETISM` chunk header: `[101, op, 1|0, chunk, last, ...]`.
-/// JS `setMultiMagnetismInfo`: `d[0]=101,d[1]=op,d[2]=1,d[3]=chunk,d[4]=last`.
-pub fn build_set_multi_magnetism(op: u8, chunk: u8, last_chunk: bool, payload56: &[u8]) -> Vec<u8> {
-    let mut head = vec![cmd::SET_MULTI_MAGNETISM, op, 1, chunk, u8::from(last_chunk), 0, 0, 0];
-    head.extend_from_slice(payload56);
-    encode_cmd(head, ReportKind::Bit7)
+    encode_cmd(
+        vec![cmd::GET_MULTI_MAGNETISM, op, 1, page, 0, 0, 0, 0],
+        ReportKind::Bit7,
+    )
 }
 
 /// Decode LE u16 list, JS `_decodeMultiMagnetismTwoByteList`.
@@ -327,6 +335,19 @@ mod tests {
         assert_eq!(Precision::P001.scale(), 100);
         assert_eq!(Precision::P0005.scale(), 200);
         assert_eq!(Precision::P0001.scale(), 1000);
+    }
+
+    #[test]
+    fn calibration_threshold_matches_driver() {
+        // JS `y && y < 768 ? 1 : 300`, with rf preferred over usb.
+        assert_eq!(calibration_threshold(None, None), 300);
+        assert_eq!(calibration_threshold(Some(0), None), 300);
+        assert_eq!(calibration_threshold(Some(1), None), 1);
+        assert_eq!(calibration_threshold(Some(767), None), 1);
+        assert_eq!(calibration_threshold(Some(768), None), 300);
+        assert_eq!(calibration_threshold(Some(1024), None), 300);
+        assert_eq!(calibration_threshold(Some(1024), Some(512)), 1);
+        assert_eq!(calibration_threshold(Some(512), Some(0)), 300);
     }
 
     #[test]

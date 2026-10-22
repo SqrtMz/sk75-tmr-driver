@@ -22,8 +22,6 @@ pub const VENDOR_SLEEP: Duration = Duration::from_millis(100);
 
 pub struct Sk75 {
     dev: HidDevice,
-    pub vid: u16,
-    pub pid: u16,
     pub path: String,
 }
 
@@ -91,36 +89,11 @@ pub fn open_sk75(vid: u16, pid: u16, path: Option<&str>, iface: Option<i32>) -> 
     );
     Ok(Sk75 {
         dev,
-        vid,
-        pid,
         path: dev_path,
     })
 }
 
 impl Sk75 {
-    /// Low-level feature write. `hidapi::HidDevice::send_feature_report`
-    /// prepends the report ID itself, so `payload` must already start with
-    /// the report ID byte (0 for SK75). Payloads longer than 64 B are
-    /// rejected by the firmware; longer JS buffers are chunked by callers.
-    pub fn send_feature(&self, payload: &[u8]) -> Result<()> {
-        if payload.is_empty() || payload.len() > FEATURE_LEN + 1 {
-            return Err(anyhow!("feature payload must be 1..=65 bytes"));
-        }
-        self.dev.send_feature_report(payload)?;
-        std::thread::sleep(SEND_DELAY);
-        Ok(())
-    }
-
-    /// Low-level feature read into a 65-byte buffer (report ID + 64 B).
-    pub fn get_feature(&self, report_id: u8) -> Result<Vec<u8>> {
-        let mut buf = vec![0u8; FEATURE_LEN + 1];
-        buf[0] = report_id;
-        std::thread::sleep(READ_DELAY);
-        let n = self.dev.get_feature_report(&mut buf)?;
-        buf.truncate(n.max(1));
-        Ok(buf)
-    }
-
     /// JS `sendMsg(t, Bit7|Bit8)`: checksum-encode then feature-write.
     /// `payload` is the raw command (e.g. 8 B or 64 B, first byte = FEA_CMD).
     /// Report ID 0 is prepended for hidapi.
@@ -176,7 +149,11 @@ impl Sk75 {
         std::thread::sleep(read_delay);
         let n = self.dev.get_feature_report(&mut buf)?;
         buf.truncate(n.max(1));
-        Ok(if buf.is_empty() { buf } else { buf[1..].to_vec() })
+        Ok(if buf.is_empty() {
+            buf
+        } else {
+            buf[1..].to_vec()
+        })
     }
 
     pub fn vendor_sleep(dur: Option<Duration>) {
@@ -195,6 +172,19 @@ impl Sk75 {
     pub fn usb_version(&self) -> Result<Option<u16>> {
         let r = self.common_msg(&[proto::cmd::GET_USB_VERSION], ReportKind::Bit7)?;
         Ok(proto::parse_usb_version(&r))
+    }
+
+    /// `getRFVersion`: `commonMsg([128], Bit7)` -> `r[2]<<8|r[1]`, with 0
+    /// meaning "not populated" (wired-only firmware). The original driver
+    /// stores this as `deviceType.version.rf` and the calibration overlay
+    /// prefers it over `version.usb`.
+    pub fn rf_version(&self) -> Result<Option<u16>> {
+        let r = self.common_msg(&[proto::cmd::GET_RF_VERSION], ReportKind::Bit7)?;
+        if r.len() < 3 || r[0] != proto::cmd::GET_RF_VERSION {
+            return Ok(None);
+        }
+        let n = ((r[2] as u16) << 8) | r[1] as u16;
+        Ok((n != 0).then_some(n))
     }
 
     /// `getPrecisionEnum` via `FEA 230`: `[230,0xAA,precision]` or None.
@@ -244,17 +234,12 @@ impl Sk75 {
         Ok(out)
     }
 
-
-
     /// `setCurrentProfile`: `sendMsg([4, t], Bit7)` + vendor sleep
     /// (`7a5b12c9.js setCurrentProfile`, FEA_CMD_SET_PROFILE=4). The driver's
     /// profile-change watcher (`___check当前按键层索引变化`) always pairs this
     /// with re-fetching that profile's data.
     pub fn set_profile(&self, profile: u8) -> Result<()> {
-        self.send_msg(
-            &[proto::cmd::SET_PROFILE, profile],
-            ReportKind::Bit7,
-        )?;
+        self.send_msg(&[proto::cmd::SET_PROFILE, profile], ReportKind::Bit7)?;
         Self::vendor_sleep(None);
         Ok(())
     }
@@ -308,36 +293,12 @@ impl Sk75 {
     /// `_decodeMultiMagnetismTwoByteList` and divided by the travel-step
     /// scale for mm. Raw units here; divide by `travel_scale()`.
     pub fn press_lift_travel_raw(&self) -> Result<(Vec<u16>, Vec<u16>)> {
-        let press =
-            self.get_multi_magnetism(proto::mag_op::TRAVEL, 4)?;
-        let lift =
-            self.get_multi_magnetism(proto::mag_op::LIFT_TRAVEL, 4)?;
+        let press = self.get_multi_magnetism(proto::mag_op::TRAVEL, 4)?;
+        let lift = self.get_multi_magnetism(proto::mag_op::LIFT_TRAVEL, 4)?;
         Ok((
             proto::decode_u16le_list(&press),
             proto::decode_u16le_list(&lift),
         ))
-    }
-
-    /// Live dynamic analog values (op 255, same layout).
-    pub fn live_dynamic_raw(&self) -> Result<Vec<u16>> {
-        let blob = self.get_multi_magnetism_with_timing(
-            proto::mag_op::LIVE_DYNAMIC,
-            4,
-            SEND_DELAY,
-            READ_DELAY,
-        )?;
-        Ok(proto::decode_u16le_list(&blob))
-    }
-
-    /// Enable/disable unsolicited magnetism streaming (`SET 27`).
-    /// JS `setKeyMagnetismReport(t)`: `[27, Number(t)]` + Bit7.
-    pub fn set_magnetism_report(&self, enable: bool) -> Result<()> {
-        self.send_msg(
-            &[proto::cmd::SET_MAGNETISM_REPOR, u8::from(enable)],
-            ReportKind::Bit7,
-        )?;
-        Self::vendor_sleep(None);
-        Ok(())
     }
 
     /// Travel calibration switches (cmds 28 / 30).
@@ -352,22 +313,16 @@ impl Sk75 {
     }
     pub fn set_max_travel_cal(&self, enable: bool) -> Result<()> {
         self.send_msg(
-            &[proto::cmd::SET_MAGNETISM_MAXIMUM_CALIBRATION, u8::from(enable)],
+            &[
+                proto::cmd::SET_MAGNETISM_MAXIMUM_CALIBRATION,
+                u8::from(enable),
+            ],
             ReportKind::Bit7,
         )?;
         Self::vendor_sleep(None);
         Ok(())
     }
 
-    /// Full calibration sequence from `setJiaoZhunKaiGuan(true)`:
-    /// min-cal on, wait 2 s, min-cal off, max-cal on.
-    pub fn calibrate_start(&self) -> Result<()> {
-        self.set_min_travel_cal(true)?;
-        std::thread::sleep(Duration::from_millis(2000));
-        self.set_min_travel_cal(false)?;
-        self.set_max_travel_cal(true)?;
-        Ok(())
-    }
     /// `setJiaoZhunKaiGuan(false)`: max-cal off.
     pub fn calibrate_stop(&self) -> Result<()> {
         self.set_max_travel_cal(false)?;

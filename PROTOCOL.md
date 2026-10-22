@@ -1,5 +1,11 @@
 # SK75 TMR protocol notes (REA-derived)
 
+> **Current entry point (2026-10-22): UI only.** `src/main.rs`, the
+> `sk75-tmr` binary and `clap` were removed. Historical `sk75-tmr …`
+> examples later in this log record earlier iterations and are not
+> current commands. The GUI is `sk75-tmr-ui`; calibration now lives in
+> the Keyboard tab, to the left of the board.
+
 ## Artifacts
 
 - `/home/mz/repositories/womier-test/womier-driver.exe`
@@ -561,3 +567,64 @@ again in the section above, per user preference.)
   `matrix::default_matrix_picks_by_device_id`,
   `keymap::reset_defaults_cover_base_and_fn_layers`; `cargo test`
   35/35 pass in both binaries.
+
+## UI-only revision + per-key travel calibration (2026-10-22)
+
+REA parent `ev_01e3780aaaa6fa4af10c93b57e89c1e7b2e517ab83d646da07edc5026c1d2e35`
+(`class C` in `7a5b12c9.js`, `_getJiaoZhunXinXi`,
+`_getJiaoZhunXinXiLoop`, `setJiaoZhunKaiGuan`) plus the calibration UI
+component `mj`/guide modal in `index.5627ed60.js`.
+
+### Command sequence
+
+The original `setJiaoZhunKaiGuan(true)` path is preserved without
+blocking the GUI thread:
+
+1. `SET_MAGNETISM_CAL (28)` with payload `1` (min-travel calibration on).
+2. Wait 2 s, then `28` with payload `0` (min-cal off).
+3. Immediately `SET_MAGNETISM_MAXIMUM_CALIBRATION (30)` with payload `1`
+   (max-cal on).
+4. The UI waits an additional 500 ms before enabling the guide's Start
+   button (original state becomes `ing_调用中`).
+5. Poll live travel with `GET_MULTI_MAGNETISM (229)`, op `254`, four
+   pages (`_getMulitMagnetismCMD(254,4,1,1)`), decode 128 little-endian
+   u16 values.
+6. Finish sends `30` with payload `0`. Cancel, read failure, and window
+   close also send `28`/`30` off, so the keyboard is never left with
+   min/max calibration armed.
+
+### Threshold and overlay
+
+- Threshold source: `version.rf ?? version.usb`. `getRFVersion` is cmd
+  `128` (`r[2]<<8|r[1]`, zero means absent); `getUSBVersion` is cmd
+  `143` (`r[8]<<8|r[7]`).
+- Original expression: `const y = version.rf ?? version.usb; const f =
+  y && y < 768 ? 1 : 300;`. Modern firmware therefore needs raw `300`
+  (3.00 mm at scale 100); versions below 768 use `1`.
+- Overlay `#74EBD5`: `0 < raw < threshold` → bottom-up height
+  `raw/threshold` at opacity 0.3; `raw >= threshold` → 100% height at
+  opacity 0.8 and the key is added to `calibratedKeyCodeSet`.
+- Calibrated keys remain at 100% / 0.8 after release. Releasing does
+  not remove them. The original "Finish" button is not gated, but this
+  UI intentionally gates it on every expected key because the requested
+  flow requires pressing all keys.
+- The Fn key is included. Both matrices encode it as the extended marker
+  `[10,1,0,0]` (`167837696`), matching `matrixToHid` and the layout's
+  `Fn` rect. Variant 3804 maps all 81 layout keys; variant 2518 maps 80
+  because its matrix has RCtrl (`228`) where the shared UI geometry has
+  AltRight (`230`).
+
+### UI placement
+
+The calibration entry is the **Travel Calibration** card to the left of
+the keyboard preview in the Keyboard tab. Clicking it opens the English
+guide modal and starts the non-blocking startup sequence; Start is
+disabled until step 4 completes. After Start the card shows `done/total`,
+a progress bar, **Finish calibration** (disabled until all expected keys
+lock), and **Cancel calibration**. The normal live-depth tint/glow is
+suppressed during calibration so the cyan overlay is unambiguous.
+
+Tests: `proto::calibration_threshold_matches_driver`,
+`layout::fn_maps_to_extended_marker_slot`,
+`layout::every_layout_key_has_a_unique_slot`, and the `ui::tests`
+locking/threshold/all-key/gating/overlay tests.

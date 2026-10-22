@@ -22,8 +22,6 @@ pub const CMD_GET_FN: u8 = 144;
 
 /// SK75 has 4 profiles (device DB `layer:4`) and Fn win/mac × 1 layer each
 /// (`fnSysLayer:{win:1,mac:1}`).
-pub const PROFILES: [u8; 4] = [0, 1, 2, 3];
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FnSys {
     Win,
@@ -35,12 +33,6 @@ impl FnSys {
         match self {
             FnSys::Win => 0,
             FnSys::Mac => 1,
-        }
-    }
-    pub fn label(self) -> &'static str {
-        match self {
-            FnSys::Win => "win",
-            FnSys::Mac => "mac",
         }
     }
 }
@@ -150,6 +142,7 @@ pub const MAX_COMBO_KEYS: usize = 3;
 /// Returns `None` when empty, longer than [`MAX_COMBO_KEYS`], or when a
 /// `skey`/`key2`-slot value exceeds one byte (`key` keeps the extended-ID
 /// `hL` packing in [`Binding::quad`]).
+#[cfg(test)]
 pub fn combo_from_keys(keys: &[u32]) -> Option<Binding> {
     if keys.is_empty() || keys.len() > MAX_COMBO_KEYS {
         return None;
@@ -194,11 +187,7 @@ pub fn function_options() -> Vec<(String, [u8; 4])> {
     ];
     // Native Fn functions below: every named entry is assignable, so factory
     // Fn assignments (e.g. LED Mode Loop on Home) can be replicated.
-    opts.extend(
-        NATIVE_FUNCTIONS
-            .iter()
-            .map(|(q, l)| (String::from(*l), *q)),
-    );
+    opts.extend(NATIVE_FUNCTIONS.iter().map(|(q, l)| (String::from(*l), *q)));
     opts
 }
 
@@ -234,10 +223,10 @@ pub fn gamepad_options() -> Vec<(String, [u8; 4])> {
 /// `hidCodeMapHtmlCode` in `f01f4a92.js`; REA parent `ev_9da292dd…`):
 /// letters, digits, controls, F-keys, navigation and modifiers.
 pub const STANDARD_KEYS: [u32; 116] = [
-    4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29,
-    30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 51, 52, 53, 54,
-    55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78,
-    79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 103,
+    4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28,
+    29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 51, 52, 53,
+    54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77,
+    78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 103,
     104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 224, 225, 226, 227, 228, 229, 230,
     231,
 ];
@@ -434,9 +423,7 @@ pub fn decode_quad(q: [u8; 4]) -> Binding {
 #[derive(Debug, Clone)]
 pub struct KeyEntry {
     pub slot: usize,
-    pub default_hid: u32,
     pub default_name: String,
-    pub quad: [u8; 4],
     pub binding: Binding,
     pub changed: bool,
 }
@@ -559,9 +546,7 @@ pub fn decode_keymap(blob: &[u8], default_matrix: &[u8; 512]) -> Vec<KeyEntry> {
         let changed = q != def;
         out.push(KeyEntry {
             slot,
-            default_hid: hid,
             default_name: matrix::hid_name(hid),
-            quad: q,
             binding: decode_quad(q),
             changed,
         });
@@ -722,18 +707,12 @@ mod tests {
                 key2: 0
             }
         );
-        assert!(matches!(
-            decode_quad([1, 0, 240, 0]),
-            Binding::Mouse { .. }
-        ));
+        assert!(matches!(decode_quad([1, 0, 240, 0]), Binding::Mouse { .. }));
         assert!(matches!(
             decode_quad([3, 0, 233, 0]),
             Binding::Function { .. }
         ));
-        assert!(matches!(
-            decode_quad([9, 0, 3, 0]),
-            Binding::Macro { .. }
-        ));
+        assert!(matches!(decode_quad([9, 0, 3, 0]), Binding::Macro { .. }));
         assert!(matches!(
             decode_quad([21, 3, 0, 0]),
             Binding::Gamepad { .. }
@@ -809,10 +788,7 @@ mod tests {
     fn live_poll_uses_1ms_timing() {
         // getJiaoZhunXinXi -> _getMulitMagnetismCMD(254,4,1,1): SEND 1, READ 1.
         // Encode-time assertion: fast request keeps the same 4-byte prefix.
-        let req = crate::proto::build_get_multi_magnetism(
-            crate::proto::mag_op::LIVE_TRAVEL,
-            3,
-        );
+        let req = crate::proto::build_get_multi_magnetism(crate::proto::mag_op::LIVE_TRAVEL, 3);
         assert_eq!(&req[0..4], &[229, 254, 1, 3]);
     }
 

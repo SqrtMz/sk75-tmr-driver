@@ -114,29 +114,32 @@ fn variant_of(device_id: Option<u32>) -> (String, &'static [u8; 512]) {
 /// Never fails outright: transport errors are captured in `error`
 /// (e.g. hidraw permission denied) so the UI can display them with
 /// the udev/wired-mode hint instead of crashing.
-pub fn read_keyboard_info(vid: u16, pid: u16, path: Option<&str>, iface: Option<i32>) -> KeyboardInfo {
+pub fn read_keyboard_info(
+    vid: u16,
+    pid: u16,
+    path: Option<&str>,
+    iface: Option<i32>,
+) -> KeyboardInfo {
     let dev = match hid::open_sk75(vid, pid, path, iface) {
         Ok(d) => d,
         Err(e) => {
             let mut info = KeyboardInfo::offline("SK75 TMR", vid, pid);
-            info.error = Some(format!("{e:#}. Hint: wired mode + udev rule udev/99-sk75-tmr.rules"));
+            info.error = Some(format!(
+                "{e:#}. Hint: wired mode + udev rule udev/99-sk75-tmr.rules"
+            ));
             return info;
         }
     };
-    let meta = hid::enumerate_sk75(vid, pid)
-        .ok()
-        .and_then(|v| {
-            v.into_iter()
-                .find(|d| d.path().to_string_lossy() == dev.path)
-        });
+    let meta = hid::enumerate_sk75(vid, pid).ok().and_then(|v| {
+        v.into_iter()
+            .find(|d| d.path().to_string_lossy() == dev.path)
+    });
     let device_id = dev.device_id().unwrap_or(None);
     let usb_version = dev.usb_version().unwrap_or(None);
     let precision = dev.precision().unwrap_or(None);
     let scale = dev
         .travel_scale()
-        .unwrap_or_else(|_| {
-            proto::scale_from_version(usb_version.filter(|v| *v != 0), None)
-        });
+        .unwrap_or_else(|_| proto::scale_from_version(usb_version.filter(|v| *v != 0), None));
     // Report-rate is best-effort; older firmware may not answer.
     let report_rate_hz = dev.report_rate_hz().unwrap_or(None);
     let (variant, mat) = variant_of(device_id);

@@ -69,6 +69,7 @@ pub fn switch_color(code: u8) -> [u8; 3] {
 /// 1-based switch number shown in the driver preview
 /// (`supportedSwitchTypes.findIndex(轴体)+1`; unknown/0xFF decodes as
 /// 高特 -> 1).
+#[cfg(test)]
 pub fn switch_number(code: u8) -> u8 {
     SK75_SWITCHES
         .iter()
@@ -76,9 +77,6 @@ pub fn switch_number(code: u8) -> u8 {
         .map(|i| i as u8 + 1)
         .unwrap_or(1)
 }
-
-/// Fallback used by the driver when decoding an unknown code.
-pub const FALLBACK_SWITCH: &str = "Gaote";
 
 pub fn switch_label(code: u8) -> String {
     SK75_SWITCHES
@@ -98,6 +96,7 @@ pub fn switch_display(code: u8) -> String {
     switch_label(code)
 }
 
+#[cfg(test)]
 pub fn switch_code(label: &str) -> Option<u8> {
     SK75_SWITCHES
         .iter()
@@ -169,7 +168,7 @@ mod tests {
         assert_eq!(switch_color(12), [240, 70, 255]); // 万磁王RGB 15746815
         assert_eq!(switch_color(13), [226, 96, 237]); // 万磁王POM 14835949
         assert_eq!(switch_color(69), [106, 90, 205]); // 玄磁轴 6970061
-        // Driver fallback: unknown code/unwritten slot -> 高特 color, number 1.
+                                                      // Driver fallback: unknown code/unwritten slot -> 高特 color, number 1.
         assert_eq!(switch_color(0xFF), [255, 234, 41]);
         assert_eq!(switch_color(7), [255, 234, 41]);
         assert_eq!(switch_number(0xFF), 1);

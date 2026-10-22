@@ -74,120 +74,68 @@ Live analog = `GET_MULTI_MAGNETISM(254, 4 pages)` → 256 B → 128×u16 LE
 `{磁通量:0, 行程值:raw, original:hid, index}` per key — flux is
 unpopulated in this firmware, travel is the analog value.
 
-## Usage (CLI)
+## Usage (UI only)
 
 ```sh
-cargo build
-./target/debug/sk75-tmr list
-./target/debug/sk75-tmr info
-./target/debug/sk75-tmr monitor --seconds 5
-./target/debug/sk75-tmr monitor --seconds 3 --dynamic --all
-./target/debug/sk75-tmr calibrate --settle 8
-./target/debug/sk75-tmr stream --on true
-./target/debug/sk75-tmr demo   # offline analog-decode proof, no hardware
+cargo build --release
+./target/release/sk75-tmr-ui
 ```
 
-`monitor` prints `slot hid name raw mm [dyn]` for every pressed TMR
-switch at max HID-bound speed (~83 Hz, 1 ms pacing, no throttle). Keep the keyboard **wired**
-(wireless calibration/reads are slower and the JS loop refuses BT).
+`sk75-tmr-ui` is the only binary. There is no CLI subcommand interface:
+device information, live analog values, rebinding, switch selection and
+travel calibration are all in the desktop window.
 
-## UI (`sk75-tmr-ui`)
-
-Native Linux desktop recreation of the driver window
-(`dist/index.html` title `GearHub`, device card in `dist/js/f70eb088.js`
-with `固件版本：{h}` + firmware-upgrade button and `IOT版本：{a}` +
-check-update button):
-
-```sh
-cargo run --bin sk75-tmr-ui
-```
-
-```sh
-# CLI rebinding (mirrors 改键 + Fn layers; single-key writes)
-./target/debug/sk75-tmr keymap read --profile 0
-./target/debug/sk75-tmr keymap read --profile 0 --fn win
-./target/debug/sk75-tmr keymap write --profile 0 --slot 0 --hid 30
-./target/debug/sk75-tmr keymap write --profile 0 --slot 0 --disable
-./target/debug/sk75-tmr keymap write --profile 0 --slot 5 --mouse Left
-./target/debug/sk75-tmr keymap write --profile 0 --slot 5 --function 'Volume+'
-./target/debug/sk75-tmr keymap write --profile 0 --fn win --slot 8 --quad 14,0,0,0
-# Live poll always runs at max speed like the original loop
-./target/debug/sk75-tmr monitor --seconds 2   # → ~83 Hz measured
-```
-
-- **Device info tab** — the “read keyboard information” option: VID:PID
+- **Device info tab** — the “read keyboard information” action: VID:PID
   (hex + dec), hidraw path, product/manufacturer, device ID
   (2518 `ry5088_womiersk75he_8k_8k` / 3804 `…_europe_3m_8k_8k`),
   variant, USB version (cmd 143 `r[8]<<8|r[7]`), precision (FEA 230
   `[230,0xAA,p]` → scale 100/200/1000, else version fallback),
-  report rate (cmd 131 `e[2]` → 125–8000 Hz), key count. Transport
+  report rate (cmd 131 `e[2]` → 125–8000 Hz) and key count. Transport
   errors are shown inline with the wired-mode + udev hint instead of
-  crashing. Live unit on this host reads e.g. id `3804`, USB `768
-  (0x0300)`, scale `100`, `8000 Hz`, `81` keys.
-- **Analog tab** — live TMR bars from op 254 (`op 255` optional):
-  per-switch `raw` + `mm`, threshold filter, measured-Hz readout.
-  Always max speed like the original `getJiaoZhunXinXiLoop`: 1 ms HID
-  pacing, back-to-back polls, no throttle (~83 Hz on real hardware).
-- **Keyboard tab** (combined board + rebinding, live input included, so
-  there is no separate Analog tab) — on-screen 81-key board in the
-  original arrangement (positions from its keymap asset), centered in
-  the window at ~50% width, each key grown into its inter-key gap.
-  Each key is a card: ORIGINAL cap name on top (direction keys use
-  Nerd-Font arrow glyphs), CURRENT binding value below it (compact
-  `LCtrl+Up` style), red/blue press-release activation travels, and —
-  with the Live input overlay on — the current depth at the very
-  bottom as `mm` + `%` of the 4.0 mm full stroke. Rows are stacked
-  into measured height bands so text cannot overlap at any key size;
-  fonts shrink a step to keep the air. When a key reaches its
-  configured activation point the fill turns black with a red glow
-  radiating around it; live press depth also tints the fill.
-  Clicking a key opens its rebind options right below: profile 1–4 and
-  Base/Fn-win/Fn-mac layer selectors. Profile changes send
-  `setCurrentProfile` (cmd 4) so the keyboard's active profile follows
-  the UI — base-keymap reads are anchored to the ACTIVE profile
-  (firmware-verified) — then fetch a full Read all (bindings +
-  switches + travels + analog snapshot), mirroring
-  `___check当前按键层索引变化` → `setCurrentProfile` →
-  `___获取所有按键信息`; Fn-layer changes only re-read (Fn ops carry
-  the profile byte). At-a-glance option grids: 116 standard keys as buttons from the
-  driver's key tables — letters, digits, PrtSc/Scroll/Pause, numpad,
-  F13–F24, modifiers; click adds / re-click removes, up to 3 per combo
-  mirroring the original `handleClick_组合键` limit; arrow keys shown as
-  Nerd-Font icons loaded from
-  the system fonts; no HID numbers to type — plus mouse, the original
-  15 media/function entries, 65 native Fn functions (the driver's `uw`/
-  master-key-table rows, plus the SK75 connector and LED-cluster quads
-  the driver leaves unnamed: Bluetooth 1/2/3, 2.4 GHz, Wired, Win
-  Lock, Win/Mac Switch, Battery Level, LED Direction-/+, LED
-  Color, LED Speed+/−, Factory Reset — names rest on the
-  factory Fn matrix `74d1dc6b.js`, cross-board family statistics and
-  operator-verified behavior, see `PROTOCOL.md`), gamepad, macro and
-  disabled; Write key
-  auto re-reads and keeps the key selected; Reset restores the selected
-  key's factory binding on the current layer — Base from the device
-  `defaultMatrix`, Fn-win/Fn-mac from `defaultFnMatrix`/
-  `defaultFnMacMatrix`, including system-key quads. Per-key
-  switch type across the six SK75 options, now named `{original driver}
-  - {source}` (Outemu, Magnetic Jade Pro/Gaming, Magneto RGB,
-  POM Magnet King, Void Switch — op 252, axis code at byte 8 of the
-  single-key write), and Write key /
-  Write switch actions.
-- **On-screen board preview** — ~50% of the screen width (responsive,
-  no more clipped or over-sized layouts), each key filled with its
-  installed switch's color from the driver's `轴体颜色字典` (the
-  demo's corner switch-number badge stays off per request; the legend
-  below the board maps the colors), and the configured activation
-  travel values exactly where the driver shows them: press bottom-left
-  in red (`#FE4545`, op 0) and release bottom-right in blue (`#0066FF`,
-  op 1) at the very bottom of the key, with the live press depth
-  (mm + % of full stroke, op 254) in its own band directly above them —
-  separated from the original cap and its rebinding by a spacer band.
-  When a key reaches its configured activation point the fill turns
-  black with a red glow radiating around it; live press depth also
-  tints the fill. Hovering a key shows its binding and travels; a
-  legend lists all six switch colors below the board.
-- **Calibration tab** — travel calibration buttons (cmds 28/30,
-  same min→max sequence as `行程校准`).
+  crashing.
+- **Keyboard tab** — the 81-key board in the original arrangement
+  (positions from `7d1d89fb.js`), plus full rebinding and per-key
+  switch selection. Each key shows its original cap name, current
+  binding, configured press/release activation travel (red/blue) and,
+  with Live input enabled, the current op-254 depth in mm and % of the
+  4.0 mm full stroke. Live press depth tints the key fill; reaching the
+  configured actuation point turns the fill black with a red glow.
+  Clicking a key opens the binding editor below the board: profiles 1–4,
+  Base/Fn-win/Fn-mac layers, 116 standard keys, mouse, media/functions,
+  native Fn functions, gamepad, macro and disabled. Write/Reset/Write
+  switch use the same single-key ops as the original driver. Hovering a
+  key shows its slot, binding, travels and live value.
+- **Travel Calibration** — the card to the left of the keyboard preview
+  starts the original per-key calibration flow. It opens the
+  “Keystroke Calibration Operation Guide” and runs the same startup
+  sequence non-blockingly: cmd 28 (min-cal) on, 2 s, cmd 28 off,
+  cmd 30 (max-cal) on, then a 500 ms settle. The guide's **Start
+  Calibration** button is disabled until that sequence finishes.
+  After Start, op-254 travel is polled continuously and every key is
+  painted with the original `#74EBD5` overlay: partial presses fill
+  proportionally at 0.3 opacity; reaching the firmware threshold locks
+  the key at 100% height / 0.8 opacity and it stays locked after
+  release. **Finish calibration** is enabled only after every
+  expected key has locked. Finish sends cmd 30 off and keeps the
+  calibrated keys at full travel. Cancel, an error, or closing the
+  window always turns min/max calibration off.
+  The threshold matches the original UI:
+  `version.rf ?? version.usb`, then `y && y < 768 ? 1 : 300`.
+  The Fn key is included via the matrix marker `[10,1,0,0]`
+  (`167837696`); production variant 3804 expects all 81 on-screen
+  keys. Variant 2518 maps 80 because its matrix has RCtrl where the
+  shared UI geometry has AltRight.
+- **On-screen board preview** — ~50% of the screen width (responsive),
+  each key filled with its installed switch's color from the driver's
+  `轴体颜色字典`; the legend below maps the colors. The demo's corner
+  switch-number badge stays off. Press/release travels are shown at the
+  bottom of each key, separated from the cap and binding by a spacer
+  band. During calibration, normal live-depth tint/glow is suppressed
+  so the calibration overlay is unambiguous.
+
+Keep the keyboard **wired** for calibration and live reads. The original
+JS loop and this UI both require the vendor feature-report interface
+(iface 2 / usage page `0xFFFF`).
 
 ## Layout
 
@@ -195,9 +143,9 @@ cargo run --bin sk75-tmr-ui
 - `src/matrix.rs` — both SK75 base matrices, Fn win/mac default matrices,
   HID names.
 - `src/hid.rs` — hidapi transport + high-level ops (`report_rate_hz` added).
-- `src/device_info.rs` — consolidated info readout shared by CLI + UI.
-- `src/main.rs` — CLI (`list/info/monitor/keymap/switch/travel/profile/calibrate/stream/demo`).
-- `src/layout.rs` — 81-key on-screen geometry from the original asset.
+- `src/device_info.rs` — consolidated info readout used by the UI.
+- `src/layout.rs` — 81-key on-screen geometry from the original asset and
+  HID→matrix-slot mapping (including the Fn marker).
 - `src/switches.rs` — SK75 switch table (driver-named) + colors + op-252
   read/write (code at byte 8).
 - `src/keymap.rs` — rebinding: `read_keymap`/`read_fn_keymap` (cmds
@@ -205,7 +153,9 @@ cargo run --bin sk75-tmr-ui
   `default_quad` (Base/Fn Reset defaults),
   `Binding` options (Key/Disabled/Mouse/Media/Gamepad/Macro/Special),
   profiles 1–4 + Fn win/mac.
-- `src/ui.rs` — egui UI (`sk75-tmr-ui`: Device info / Keyboard / Calibration).
+- `src/ui.rs` — UI entry point and egui implementation (`sk75-tmr-ui`:
+  Device info / Keyboard, including the travel-calibration guide,
+  startup state machine and key overlay).
 - `udev/99-sk75-tmr.rules` — permissions.
 
 ## Limitations
@@ -219,3 +169,8 @@ cargo run --bin sk75-tmr-ui
 - No LED or macro-content write paths yet (remap + switch writes are
   implemented; read the JS `setMultiMagnetismInfo` chunking in
   `PROTOCOL.md` to extend).
+- Travel calibration is wired-only. It uses the original cmd 28/30
+  sequence and op-254 threshold; the firmware owns persistence.
+- Variant 2518 cannot match the shared 81-key UI geometry one-to-one
+  (RCtrl in its matrix vs AltRight in the layout), so calibration expects
+  80 slots there. Variant 3804 maps all 81.

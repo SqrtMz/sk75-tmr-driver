@@ -14,11 +14,11 @@ pub const CANVAS_H: f32 = 281.0;
 
 /// (layout id, HID usage, x, y, w, h, label).
 pub const KEYS: [(&str, u32, f32, f32, f32, f32, &str); 81] = [
-("ArrowRight", 79, 691.0, 240.0, 40.0, 40.0, "→"),
+    ("ArrowRight", 79, 691.0, 240.0, 40.0, 40.0, "→"),
     ("ArrowDown", 81, 645.0, 240.0, 40.0, 40.0, "↓"),
     ("ArrowLeft", 80, 599.0, 240.0, 40.0, 40.0, "←"),
     ("AltRight", 230, 461.0, 240.0, 48.0, 40.0, "Alt"),
-    ("Fn", 0, 515.0, 240.0, 48.0, 40.0, "Fn"),
+    ("Fn", 167_837_696, 515.0, 240.0, 48.0, 40.0, "Fn"),
     ("Space", 44, 163.0, 240.0, 292.0, 40.0, "Space"),
     ("AltLeft", 226, 109.0, 240.0, 48.0, 40.0, "Alt"),
     ("MetaLeft", 227, 55.0, 240.0, 48.0, 40.0, "Win"),
@@ -98,7 +98,10 @@ pub const KEYS: [(&str, u32, f32, f32, f32, f32, &str); 81] = [
 ];
 
 /// Resolve a layout key to its firmware matrix slot.
-/// `Fn` is a layer key with no matrix slot (returns None).
+///
+/// The Fn key is not a HID usage: both SK75 matrices encode it as the
+/// extended marker `[10,1,0,0]`, which packs to `167837696` (`0x0A010000`)
+/// exactly like the original `matrixToHid`/keymap asset.
 pub fn slot_for(hid: u32, matrix: &[u8; 512]) -> Option<usize> {
     if hid == 0 {
         return None;
@@ -106,6 +109,12 @@ pub fn slot_for(hid: u32, matrix: &[u8; 512]) -> Option<usize> {
     matrix
         .chunks_exact(4)
         .position(|c| crate::matrix::matrix_to_hid([c[0], c[1], c[2], c[3]]) == hid)
+}
+
+/// Every layout key's matrix slot, in board order. Both SK75 variants expose
+/// exactly 81 populated slots (80 HID keys + the Fn marker).
+pub fn all_slots(matrix: &[u8; 512]) -> Vec<usize> {
+    KEYS.iter().filter_map(|k| slot_for(k.1, matrix)).collect()
 }
 
 #[cfg(test)]
@@ -129,7 +138,36 @@ mod tests {
     }
 
     #[test]
-    fn fn_has_no_slot() {
+    fn fn_maps_to_extended_marker_slot() {
+        assert_eq!(slot_for(167_837_696, &crate::matrix::MATRIX_2518), Some(65));
+        assert_eq!(slot_for(167_837_696, &crate::matrix::MATRIX_3804), Some(71));
         assert_eq!(slot_for(0, &crate::matrix::MATRIX_2518), None);
+    }
+
+    #[test]
+    fn every_layout_key_has_a_unique_slot() {
+        // 3804 is the host variant and maps all 81 rects (80 HID keys + Fn).
+        // 2518's matrix has RCtrl (228) where the shared UI geometry has
+        // AltRight (230), so that one rect has no slot on 2518.
+        for (matrix, expected) in [
+            (&crate::matrix::MATRIX_2518, 80),
+            (&crate::matrix::MATRIX_3804, 81),
+        ] {
+            let slots = all_slots(matrix);
+            assert_eq!(slots.len(), expected);
+            let mut unique = slots.clone();
+            unique.sort_unstable();
+            unique.dedup();
+            assert_eq!(unique.len(), expected);
+            assert!(slots.contains(&layout_fn_slot(matrix)));
+        }
+    }
+
+    fn layout_fn_slot(matrix: &[u8; 512]) -> usize {
+        crate::matrix::populated_keys(matrix)
+            .into_iter()
+            .find(|(_, h)| *h == 167_837_696)
+            .map(|(s, _)| s)
+            .unwrap()
     }
 }
