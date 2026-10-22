@@ -246,6 +246,30 @@ impl Sk75 {
 
 
 
+    /// `setCurrentProfile`: `sendMsg([4, t], Bit7)` + vendor sleep
+    /// (`7a5b12c9.js setCurrentProfile`, FEA_CMD_SET_PROFILE=4). The driver's
+    /// profile-change watcher (`___check当前按键层索引变化`) always pairs this
+    /// with re-fetching that profile's data.
+    pub fn set_profile(&self, profile: u8) -> Result<()> {
+        self.send_msg(
+            &[proto::cmd::SET_PROFILE, profile],
+            ReportKind::Bit7,
+        )?;
+        Self::vendor_sleep(None);
+        Ok(())
+    }
+
+    /// `getCurrentProfile`: `commonMsg([132], Bit7)` -> `r[1]`
+    /// (FEA_CMD_GET_PROFILE=132). Driver startup syncs the UI layer
+    /// selector to this ("const t = await this.dev.getCurrentProfile()??0").
+    pub fn get_profile(&self) -> Result<Option<u8>> {
+        let r = self.common_msg(&[proto::cmd::GET_PROFILE], ReportKind::Bit7)?;
+        if r.len() < 2 || r[0] != proto::cmd::GET_PROFILE {
+            return Ok(None);
+        }
+        Ok(Some(r[1]))
+    }
+
     /// `getReportRate`: `commonMsg([131], Bit7)` -> `e[2]` 0..6 maps to Hz.
     pub fn report_rate_hz(&self) -> Result<Option<u32>> {
         let r = self.common_msg(&[proto::cmd::GET_REPORT], ReportKind::Bit7)?;
@@ -264,7 +288,7 @@ impl Sk75 {
         })
     }
 
-    /// Live analog travel for every matrix slot (op 254, 4 pages = 256 B
+    /// Live per-key analog travel for every matrix slot (op 254, 4 pages = 256 B
     /// -> 128 u16 LE). Returns raw units; divide by `travel_scale()` for mm.
     /// JS `_getJiaoZhunXinXi` (+ `_decodeMultiMagnetismTwoByteList`).
     pub fn live_travel_raw(&self) -> Result<Vec<u16>> {
@@ -275,6 +299,23 @@ impl Sk75 {
             READ_DELAY,
         )?;
         Ok(proto::decode_u16le_list(&blob))
+    }
+
+    /// Configured activation travel per slot: press (op 0) + release
+    /// (op 1), each 4 pages = 256 B -> 128 u16 LE (one per matrix slot).
+    /// JS `getMultiMagnetismInfo`: `触发行程` = `_getMulitMagnetismCMD(0, 4)`,
+    /// `抬起行程` = `_getMulitMagnetismCMD(1, 4)`, both through
+    /// `_decodeMultiMagnetismTwoByteList` and divided by the travel-step
+    /// scale for mm. Raw units here; divide by `travel_scale()`.
+    pub fn press_lift_travel_raw(&self) -> Result<(Vec<u16>, Vec<u16>)> {
+        let press =
+            self.get_multi_magnetism(proto::mag_op::TRAVEL, 4)?;
+        let lift =
+            self.get_multi_magnetism(proto::mag_op::LIFT_TRAVEL, 4)?;
+        Ok((
+            proto::decode_u16le_list(&press),
+            proto::decode_u16le_list(&lift),
+        ))
     }
 
     /// Live dynamic analog values (op 255, same layout).

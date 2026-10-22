@@ -5,6 +5,8 @@
 //! Each is 512 u8 = 128 slots x 4 B. Non-zero slots are real keys;
 //! `[0,0,hid,0]` decodes via JS `matrixToHid` to the USB HID usage `hid`.
 //! The two variants differ only at slots 65/67 (`[55,0,10,1]` marker moves).
+//! Fn-layer defaults (`FN_MATRIX_*`) come from the same modules'
+//! `defaultFnMatrix`/`defaultFnMacMatrix` tables (512 u8 each).
 
 /// Matrix for id 2518 (`ry5088_womiersk75he_8k_8k`).
 pub const MATRIX_2518: [u8; 512] = [
@@ -100,6 +102,127 @@ pub const MATRIX_3804: [u8; 512] = [
     0, 0, 0, 0, 0, 0, 0, 0,
 ];
 
+/// Fn-layer default matrix for id 3804, Windows (`defaultFnMatrix` in
+/// `74d1dc6b.js`). Same 128-slot layout as the base matrix.
+pub const FN_MATRIX_3804_WIN: [u8; 512] = [
+    10, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    3, 0, 112, 0, 0, 0, 0, 0, 14, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    3, 0, 111, 0, 0, 0, 0, 0, 14, 0, 1, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 10, 3, 0, 0,
+    0, 0, 227, 43, 0, 0, 0, 0, 14, 0, 2, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    3, 0, 182, 0, 0, 0, 0, 0, 14, 0, 5, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    3, 0, 205, 0, 0, 0, 0, 0, 14, 0, 6, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    3, 0, 181, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 227, 8, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    3, 0, 138, 1, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 10, 5, 3, 0, 0, 0, 0, 0,
+    3, 0, 35, 2, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    3, 0, 226, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    3, 0, 234, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    3, 0, 233, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 13, 5, 0, 2,
+    10, 12, 0, 0, 10, 8, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 13, 2, 1, 0, 13, 2, 2, 0,
+    13, 1, 0, 0, 13, 5, 1, 0, 13, 3, 2, 0,
+    13, 3, 1, 0, 0, 0, 0, 0, 13, 5, 0, 1,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0,
+];
+
+/// Fn-layer default matrix for id 3804, macOS (`defaultFnMacMatrix` in
+/// `74d1dc6b.js`). Differs from Windows at slots 17/18/42/48/54.
+pub const FN_MATRIX_3804_MAC: [u8; 512] = [
+    10, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    3, 0, 112, 0, 0, 0, 0, 0, 14, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    3, 0, 111, 0, 0, 0, 0, 0, 14, 0, 1, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 224, 82, 0, 0, 0, 0, 0, 14, 0, 2, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    3, 0, 182, 0, 0, 0, 0, 0, 14, 0, 5, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    3, 0, 205, 0, 0, 0, 0, 0, 14, 0, 6, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    3, 0, 181, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    3, 0, 160, 2, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    13, 2, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 10, 5, 3, 0, 0, 0, 0, 0,
+    13, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    3, 0, 226, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    3, 0, 234, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    3, 0, 233, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 13, 5, 0, 2,
+    10, 12, 0, 0, 10, 8, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 13, 2, 1, 0, 13, 2, 2, 0,
+    13, 1, 0, 0, 13, 5, 1, 0, 13, 3, 2, 0,
+    13, 3, 1, 0, 0, 0, 0, 0, 13, 5, 0, 1,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0,
+];
+
+/// Fn-layer default matrix for id 2518 (`defaultFnMatrix` in
+/// `7de29f04.js`). Byte-identical to [`FN_MATRIX_3804_WIN`].
+pub const FN_MATRIX_2518_WIN: [u8; 512] = FN_MATRIX_3804_WIN;
+
+/// The 2518 module defines no `defaultFnMacMatrix`; the shared base class
+/// (`7a5b12c9.js`) assigns `defaultFnMacMatrix = this.defaultFnMatrix`.
+pub const FN_MATRIX_2518_MAC: [u8; 512] = FN_MATRIX_2518_WIN;
+
+/// Default base-layer matrix for a detected device id.
+pub fn default_matrix(device_id: Option<u32>) -> &'static [u8; 512] {
+    match device_id {
+        Some(3804) => &MATRIX_3804,
+        _ => &MATRIX_2518,
+    }
+}
+
+/// Default Fn-layer matrix for a detected device id and OS.
+pub fn default_fn_matrix(device_id: Option<u32>, mac: bool) -> &'static [u8; 512] {
+    match (device_id, mac) {
+        (Some(3804), false) => &FN_MATRIX_3804_WIN,
+        (Some(3804), true) => &FN_MATRIX_3804_MAC,
+        (_, false) => &FN_MATRIX_2518_WIN,
+        (_, true) => &FN_MATRIX_2518_MAC,
+    }
+}
 
 /// Decode one 4-byte matrix slot to a USB HID usage like JS `matrixToHid`:
 /// `[0,0,hid,0] -> hid`, otherwise the packed u32 (extended keys).
@@ -304,5 +427,35 @@ mod tests {
             }
         }
         assert!(diffs > 0 && diffs <= 8, "diffs={diffs}");
+    }
+
+    fn quad(m: &[u8; 512], slot: usize) -> [u8; 4] {
+        [m[slot * 4], m[slot * 4 + 1], m[slot * 4 + 2], m[slot * 4 + 3]]
+    }
+
+    #[test]
+    fn fn_defaults_match_driver_tables() {
+        // 74d1dc6b.js defaultFnMatrix / defaultFnMacMatrix.
+        assert_eq!(quad(&FN_MATRIX_3804_WIN, 0), [10, 2, 0, 0]); // Fn reset
+        assert_eq!(quad(&FN_MATRIX_3804_WIN, 18), [0, 0, 227, 43]); // LGui+Tab
+        assert_eq!(quad(&FN_MATRIX_3804_WIN, 42), [0, 0, 227, 8]); // LGui+E
+        assert_eq!(quad(&FN_MATRIX_3804_MAC, 18), [0, 224, 82, 0]); // LCtrl+Up
+        assert_eq!(quad(&FN_MATRIX_3804_MAC, 42), [3, 0, 160, 2]); // mac search
+        assert_eq!(quad(&FN_MATRIX_3804_MAC, 17), [0, 0, 0, 0]);
+        // 2518 has only a win table, byte-identical to 3804's; the shared
+        // base class falls back to it for mac.
+        assert_eq!(FN_MATRIX_2518_WIN, FN_MATRIX_3804_WIN);
+        assert_eq!(FN_MATRIX_2518_MAC, FN_MATRIX_2518_WIN);
+    }
+
+    #[test]
+    fn default_matrix_picks_by_device_id() {
+        assert_eq!(default_matrix(Some(2518)), &MATRIX_2518);
+        assert_eq!(default_matrix(Some(3804)), &MATRIX_3804);
+        assert_eq!(default_matrix(None), &MATRIX_2518);
+        assert_eq!(default_fn_matrix(Some(2518), false), &FN_MATRIX_2518_WIN);
+        assert_eq!(default_fn_matrix(Some(2518), true), &FN_MATRIX_2518_MAC);
+        assert_eq!(default_fn_matrix(Some(3804), false), &FN_MATRIX_3804_WIN);
+        assert_eq!(default_fn_matrix(Some(3804), true), &FN_MATRIX_3804_MAC);
     }
 }

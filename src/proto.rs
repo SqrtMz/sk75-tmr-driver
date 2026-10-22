@@ -210,6 +210,20 @@ pub fn raw_to_mm(raw: u16, scale: u32) -> f32 {
     raw as f32 / scale as f32
 }
 
+/// Display decimals for travel mm values — the driver's `travelPrecision`
+/// getter (`index.5627ed60.js`): number of decimal digits of the
+/// press-travel step, default 2. With step = 1/scale that is 2 for
+/// scale 100 (0.01 mm), 3 for 200 (0.005 mm) / 1000 (0.001 mm).
+pub fn travel_digits(scale: u32) -> usize {
+    let mut d = 0usize;
+    let mut v = 1u32;
+    while v < scale && d < 9 {
+        v *= 10;
+        d += 1;
+    }
+    d.clamp(1, 9)
+}
+
 /// Parse `GET_FEATURE_LIST (230)` response: must be `[230, 0xAA, precision, ...]`.
 pub fn parse_feature_list(resp: &[u8]) -> Option<Precision> {
     if resp.len() < 3 || resp[0] != cmd::GET_FEATURE_LIST || resp[1] != 0xAA {
@@ -276,6 +290,24 @@ mod tests {
         assert_eq!(decode_u16le_list(&[0x64, 0x00, 0xC8, 0x00]), vec![100, 200]);
         assert_eq!(raw_to_mm(200, 100), 2.0);
         assert!((raw_to_mm(5, 1000) - 0.005).abs() < 1e-6);
+    }
+
+    #[test]
+    fn travel_digits_match_driver_precision() {
+        // travelPrecision = decimals of the step 1/scale, default 2.
+        assert_eq!(travel_digits(100), 2); // 0.01 mm
+        assert_eq!(travel_digits(200), 3); // 0.005 mm
+        assert_eq!(travel_digits(1000), 3); // 0.001 mm
+        assert_eq!(travel_digits(10), 1); // 0.1 mm
+    }
+
+    #[test]
+    fn press_lift_travel_request_layout() {
+        // getMultiMagnetismInfo: _getMulitMagnetismCMD(0,4) / (1,4).
+        let p = build_get_multi_magnetism(mag_op::TRAVEL, 4);
+        assert_eq!(&p[0..4], &[229, 0, 1, 4]);
+        let l = build_get_multi_magnetism(mag_op::LIFT_TRAVEL, 4);
+        assert_eq!(&l[0..4], &[229, 1, 1, 4]);
     }
 
     #[test]

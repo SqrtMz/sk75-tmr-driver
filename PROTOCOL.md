@@ -145,7 +145,9 @@
 - Switch types: axis table `P` (`Gaote=0, Jade Pro=2, Jade Gaming=3,
   Magnet-King RGB=12, POM Magnet-King=13, Xuan Magnetic=69`, …109 entries),
   SK75 `supportedSwitchTypes` (6 entries, id 2518 + 3804) with special
-  display POM mapping; single-key write `[101,252,0,slot,1,code]`,
+  display POM mapping; single-key write
+  `[101,252,0,slot,1,0,0,ck,code]` (code at byte 8; an earlier build put
+  it at byte 5 and the firmware stored 0 — see the 2026-10-22 section),
   batch read `(252,2)`. Live check: slot 8 reads 69, unset slots 0xFF
   (driver default Gaote), trailing slots 0.
 - Poll: the 10 Hz cap is removed everywhere; live reads always use the
@@ -290,3 +292,272 @@
   afterwards; both decode correctly (O passthrough vs Disabled per the
   original's forbidden semantics). Only writes made this session were
   base slot 0 LCtrl + immediate Esc restore (readback verified clean).
+
+## Board preview travel values + per-switch colors + switch names (this request)
+
+- REA `analyze_javascript_application` (scoped `2a8cd9c4.js`+
+  `d9f04973.js`+`1eafbcc7.js`+`4f13328e.js`+`9528bb70.js`+
+  `index.5627ed60.js`+`60ee4367.js`) →
+  `ev_a6632e7b81048a6be876ba8d6c4d399de560fe496f69b34d887e1f1756bb13cf`,
+  corroborated by direct static reads.
+- Travel values come from `getMultiMagnetismInfo`
+  (`7a5b12c9.js`): press `触发行程` = `_getMulitMagnetismCMD(0, 4)`,
+  release `抬起行程` = `_getMulitMagnetismCMD(1, 4)` — 4 pages each,
+  u16 LE per slot, divided by the travel-step scale for mm.
+  On-key rendering (`d9f04973.js` `ve`/`pe` + SVG template
+  `KeyBox_KeyMappings_RT` in `2a8cd9c4.js`): press bottom-left
+  `#FE4545`, release bottom-right `#0066FF`, font-size
+  `8*(4/(precision+2))`, `toFixed(travelPrecision)` formatting;
+  `travelPrecision` getter = decimal digits of the press-travel step
+  (default 2) → implemented as `proto::travel_digits(scale)`
+  (100→2, 200→3, 1000→3).
+- Switch colors from `轴体颜色字典` (`index.5627ed60.js`), applied by
+  the driver `轴体颜色字典[轴体] ?? 16771625`; unknown code/0xFF falls
+  back to 高特 like `_解码轴体`. Our fills (plus a depth-driven
+  lighten and darker-than-driver notch, our aesthetic choices):
+  高特 16771625 #FFEA29, 磁玉pro 3080153 #2EFFD9,
+  磁玉gaming 12026111 #B780FF, 万磁王RGB 15746815 #F046FF,
+  万磁王POM 14835949 #E260ED, 玄磁轴 6970061 #6A5ACD.
+- Switch names: driver-side English from i18n `9528bb70.js`
+  (`高特:"Outemu"`, `磁玉pro:"Magnetic Jade Pro"`,
+  `磁玉gaming:"Magnetic Jade Gaming"`, `万磁王RGB:"Magneto RGB"`,
+  `万磁王POM:"POM Magnet King"` via SK75
+  `specialSwitchDisplayName:{万磁王POM:"POM万磁王"}`,
+  `玄磁轴:"Void Switch"`); display
+  `{driver name} - {source name}`. Note: request said "POM Manget
+  King" → corrected to the driver's "POM Magnet King".
+- Board, per request, also shows the switch-number badge
+  (`supportedSwitchTypes.findIndex(轴体)+1`, notch top-left) and
+  selected-key outline `#FD4444` (rgba(253.94,68.77,68.77), 1.7px).
+- Implemented: preview scales to available width (fixed-732px canvas
+  clipped labels before), fonts scale with it; key fill = switch color;
+  red/blue activation values per key; hover tooltip (binding + travels +
+  switch); color legend. New CLI `travel` subcommand prints
+  press/release per key. Live check: all 81 mapped keys read
+  press 50 / release 50 = 0.50 mm (uniform factory value, ops 0/1);
+  switch read shows a Void-Switch main block + 45 Outemu keys on this
+  board, so the two-color preview will be visible immediately.
+
+## Key values on the board + no-overlap travel text (this request)
+
+- REA direct static reads (`2a8cd9c4.js` template + `d9f04973.js`
+  renderer helpers): the key-name slot of `KeyBox_KeyMappings_RT`
+  (`#text_keyCode`, font-size 12, centered, tspan y=26.232) is filled
+  from the `keyCodeDisplayText` prop — i.e. the key's CURRENT value
+  (binding label), not the original cap name. Helper `ue()`: when the
+  label contains spaces it re-tspans the words stacked vertically
+  (line height font*1.2), each line centered at x=width/2, block
+  vertically centered (`y=(h-lines*1.2*font)/2+font`); overflow is
+  allowed in the original (svg `overflow="visible"`).
+- Travel text anchors (template tspans, 42-unit key box): press
+  `#FE4545` x=3, y=39.488, lift `#0066FF` x=22 (LEFT-anchored, so the
+  same-px split never collides in the browser); `he()` shifts lift
+  right by (keyW−42) → glued to the right edge on wide keys; `pe()`
+  sets both travel fonts to `8*(4/(precision+2))` so added decimals
+  keep the printed width ~constant. Our egui font advances are wider
+  than the browser's at small sizes, so values previously overlapped
+  on normal 40-unit keys at 45% scale.
+- Implemented: key text = `binding.short_label()` when non-empty else
+  original label (original stays in hover tooltip); multi-word labels
+  stacked like `ue()`; font fitted per key (12k shrinking until the
+  block fits the key's own rect above the travel row). Travel numbers
+  use the template anchors `left+3k` / `right−20k` and disjoint
+  per-key fitting zones (press [left+3k, lift-anchor), lift (anchor,
+  right−2k]), each number shrinking only within its own span → no
+  horizontal overlap on any key. Board painter is now centered in the
+  window (`Layout::top_down(Center)` wrapping the allocate_painter).
+
+## Bigger keys, banded rows, Nerd arrows back, activation glow (this request)
+
+- Overlap report: the modified keybind text could still touch the
+  travel numbers. The card rows are now STACKED from bounded band
+  heights (live bottom-anchored, press band above it, orig/binding
+  sharing the rest, 50/50 when bound; both shrunk proportionally when
+  the pair exceeds its zone) — vertical overlap is impossible, not
+  merely unlikely. Base fonts reduced one notch (orig/binding 9.2k,
+  live 6.2k); the `pe()` travel font is untouched for fidelity.
+- Board further enlarged (~58% → ~66% of screen width, min 420px,
+  scale 0.75..3.4) AND each key grows into its inter-key gaps
+  (uniform 1.7k inflate inside the asset's 46-unit pitch over the
+  40-unit key box) — bigger keys, unchanged geometry fidelity.
+  The shipped preview now targets ~50% of the screen width (`ui.rs`,
+  matching README); the 45/58/66% figures record earlier requests.
+- Nerd-Font arrow glyphs restored (`matrix::arrow_glyph`) after the
+  vector-polygon experiment: the user prefers the real icons, and the
+  regular binding row now ALWAYS draws beneath for bound arrow keys —
+  the vector branch previously replaced the whole card, hiding the
+  modified text.
+- Live-input activation hook: when the current depth reaches the key's
+  configured press-travel point (`mm >= travel_press`), the fill turns
+  near-black (`#0D0D0D`, auto-contrast text goes white) and a layered
+  red glow (`PRESS_COL` #FE4545 strokes, alpha 0.65→0.08, up to
+  9.6k px) radiates around the key.
+
+## Restored two-line key card + vector arrows + live mm/% (earlier request)
+
+(Superseded: the vector-arrow experiment became Nerd-Font glyphs
+again in the section above, per user preference.)
+
+- User preference over the driver's single `keyCodeDisplayText` slot
+  (`d9f04973.js Ke`): each key is a card — ORIGINAL cap name on top
+  (muted), CURRENT binding below (full color, combos compacted
+  `"LCtrl + Up"`→`"LCtrl+Up"` for one line), red/blue press/release
+  travels, and a live-depth row at the bottom (`mm` + `%`).
+- Arrows: the Nerd-Font glyphs (`matrix::arrow_glyph`, Font Awesome
+  `\u{f060}`..`\u{f063}`) degrade to missing-text when the system icon
+  font is absent; the four direction keys now draw vector polygons
+  (`draw_arrow`: head triangle + stem, hid 79/80/81/82) so arrows
+  always render.
+- Live percent reference: `FULL_TRAVEL_MM = 4.0` (nominal magnetic
+  total travel; no explicit %-of-total conversion exists in the driver
+  JS — REA grep) — depth tint switched from the old 3.4 heuristic to
+  the same 4.0 constant, legend states the reference.
+- Board enlarged as requested: ~45% → ~58% of screen width
+  (min 380px, scale clamp 0.7..3.4); per-key fitting zones keep every
+  row inside its key at any size.
+
+## Profiles are active-profile anchored + preview 45% (earlier request)
+
+- REA `analyze_javascript_application` (scoped `7a5b12c9.js`+
+  `index.5627ed60.js`) → corroborated by direct static reads:
+  - `setCurrentProfile(t)` = `sendMsg([FEA_CMD_SET_PROFILE=4, t], Bit7)`
+    + vendor sleep; `getCurrentProfile()` = `commonMsg([132], Bit7)[1]`.
+  - Startup: `const t = await this.dev.getCurrentProfile() ?? 0;
+    当前按键层 = t` — the UI selector always mirrors the device.
+  - Layer-change watcher `___check当前按键层索引变化`: profile change →
+    `await setCurrentProfile(t)` **then** re-read (`___获取所有按键信息`);
+    Fn/son-layer change (`___checkFn层索引变化`) sends nothing extra —
+    Fn reads/writes carry the profile byte (`[144/16, sys, profile, …]`).
+- Live confirmation (read-only + cmd-4 switches, restored to profile 0):
+  `[138, P, …]` returns the ACTIVE profile's base keymap for every P
+  (all 4 profile bytes Identical md5), while `[144, sys, P, …]` +
+  `[138]`+ travels DO honor P (Fn p0 vs p2 differ; travels p0 =
+  0.50 mm uniform, p2 = 2.00/2.80 mm — per-profile data). cmd 4 verified
+  via cmd 132 read-back (2 → 1 → 3 → 0). So the old UI (no cmd 4) always
+  showed the profile the keyboard was on — that's why profile switching
+  "did nothing".
+- Implemented: `hid::set_profile`/`get_profile`; UI syncs the selector
+  from cmd 132 on every Read-all; profile-dropdown change sends cmd 4
+  before a full Read-all fetch (profile turns also span travels, which
+  the earlier bindings-only refetch missed); `ensure_active_profile`
+  guard before key/switch writes; CLI `profile read|set N`; per
+  keymap-read help notes base-layer anchoring.
+- Board preview now targets 45% of the screen width (responsive,
+  `screen_rect * 0.45`), replacing the full-width layout.
+
+## Fn connector/cluster quads named + preview card rework (this request)
+
+- REA `analyze_javascript_application` (app tree, scoped `74d1dc6b.js` +
+  `index.5627ed60.js` + `df09d59e.js` + `7a5b12c9.js`) →
+  `ev_f6353762a596f30cb1828ceb285f54b5342bf855175e4d06704cfd45dd4638cb`
+  (subject sha256 `d78e29ed825b…12079`; module `74d1dc6b.js` artifact
+  sha256 `02328f27df…9d8d5` exports exactly
+  `Ry5088_womier_sk75he_europe_3m_8k_8k`), corroborated by direct static
+  reads (python/ripgrep) over the extracted tree.
+- Naming-source sweep — the original driver does not name these quads
+  either. The 176-entry master key table (`{value,scanCode,hidCode,…}`,
+  hidCode = big-endian quad) contains only the tag-10/13 rows already in
+  our table (+`[13,6,x]` ledMode1/2) — no tag-14 rows at all; `uw`/`fL`,
+  `O_`/`Fa` (only `Ie.PAIR=[10,5,0,0]`, labeled "PAIR"), per-device
+  default modules (bare arrays), the SK75 ui_info `7d1d89fb.js`
+  (geometry + displayText only), the help device (`helpRy5088` →
+  `fa78cffb.js` stub), all i18n dictionaries, and the firmware command
+  surface (`FEA_CMD_GET_FN` is the plain Fn keymap read; no
+  function-description getter): none carry connectivity/RGB Fn labels.
+  The board overlay types them `ConfigUnknown` → `系统按键`
+  ("System") — same as our previous build.
+- Identification: the SK75 factory Fn default is the device module
+  `74d1dc6b.js` (loader `df09d59e.js`:
+  `ry5088_womier_sk75he_europe_3m_8k_8k` → `import("./74d1dc6b.js")`),
+  128-quads `defaultFnMatrix`/`defaultFnMacMatrix` matching the live
+  `keymap read --fn win` slot-for-slot (slot 8 Q `[14,0,0,0]`, 14 W
+  `[14,0,1,0]`, 20 E `[14,0,2,0]`, 26 R `[14,0,5,0]`, 32 T `[14,0,6,0]`,
+  52 M `[10,5,3,0]`, 77 Left `[13,5,0,2]`, 79 Bksp `[10,8,0,0]`,
+  85 End `[13,5,1,0]`, 86 PgUp `[13,3,2,0]`, 87 PgDn `[13,3,1,0]`, 89
+  Right `[13,5,0,1]`, 0 Esc `[10,2,0,0]`, 17 LGui `[10,3,0,0]`).
+  Family statistics across ~100 sibling modules: `[14,0,x]` exists only
+  on three-mode boards (five quads on Q/W/E/R/T); `[13,5,a,b]` /
+  `[13,3,±]` sit on the arrow cluster mirroring the labelled
+  `[13,2,±]` brightness pair; `[10,2]/[10,3]/[10,8]` appear on every
+  board including wired-only ones.
+- Naming (operator-verified panel answers): Fn+Q/W/E/R/T = Bluetooth
+  1/2/3, 2.4 GHz, Wired; Fn+Left/Right = LED Direction-/LED Direction+;
+  Fn+Win = Win-key lock (NOT a Win/Mac switch); Fn+Backspace = battery
+  level; Fn+M = Windows/Mac mode switch. Operator follow-up: Fn+End
+  (`[13,5,1,0]`) changes the LED color → named `LED Color`; Fn+Esc =
+  `Factory Reset` confirmed. Still inferred from families, flagged in
+  the table comment: Fn+PgUp/PgDn = LED Speed+/LED Speed- (`[13,3,±]`).
+- Implemented: `NATIVE_FUNCTIONS` 51 → 65 entries, all byte-exact
+  (round-trip `quad()` asserted); decode now names the 14 System slots
+  of Fn win/mac — live `keymap read --fn win` shows Bluetooth 1 on Q,
+  2.4 GHz on R, Wired on T, Win Lock on LGui, Win/Mac Switch on M,
+  Battery Level on Backspace, LED Direction-/+ on Left/Right,
+  LED Color on End, LED Speed+/- on PgUp/PgDn, Factory Reset
+  on Esc. `function_options()` picks them up automatically (15 original
+  media entries + 65 natives in the rebind picker). Tests:
+  `sk75_fn_cluster_quads_are_named_functions` (labels + quad
+  round-trips; `[10,5,0,0]` stays Unknown/System) and extended picker
+  assertions; 32/32 pass.
+- Preview card rework per request: the demo's switch-number corner
+  badge (`#g_switchPath_and_switchNumberText`: notch + 1-based switch
+  number) is removed — colors still map to switch types via the legend
+  (legend hint reworded). Row bands reordered: red/blue
+  press/release travels return to the very bottom (the driver template
+  position, press `left+3k`/lift `right-20k` anchors unchanged), the
+  live mm+% depth row moves into its own band directly above them, and
+  a spacer band (`1.3k`, fitted like the text rows) now separates the
+  original cap row from the current binding row.
+
+## Correct op-252 switch write + key Reset defaults (2026-10-22)
+
+- REA `analyze_javascript_application` (scoped `7a5b12c9.js` +
+  `index.5627ed60.js` + `74d1dc6b.js` + `7de29f04.js` + `f01f4a92.js`)
+  → parent
+  `ev_f2e38f5e27a1a845a92bee0cd06911038643323135906d53c482aa060074a1c4`,
+  summary
+  `ev_270e853addc8bff0bf3bc843a9d0136049659aaddc2951c2f141d5c100ceed5b`.
+- Switch write root cause: JS `_sendMagnetismInfoSimpleCMD(t,e,n,i)` builds
+  an 8-byte header (`s[0]=101,s[1]=op,s[2]=0,s[3]=slot,s[4]=apply?1:0`,
+  rest zero), then sends `[...s, ...i]`; `___encodeCmd` writes the Bit7
+  checksum at index 7 over 0..6. The axis code therefore ships at **byte
+  8**. Our old request `[101,252,0,slot,1,code]` was padded to 9 bytes by
+  `encode_cmd`, so the firmware read 0 at byte 8 and stored Gaote
+  (code 0) on every write. The corrected request is
+  `[101,252,0,slot,1,0,0,ck,code]` (`src/switches.rs`,
+  `write_switch_type`).
+- Live proof (id 3804): writing the corrected packet stored code 13 on
+  normal slot 41 and on system slot 71 (base default `[10,1,0,0]`, the Fn
+  key); both read back 13. Earlier broken writes had turned slots
+  0/8/14/33 into 0; all touched slots were restored to the installed
+  Void Switch code 69 and re-read as 69. Direct matrix-slot targeting
+  therefore persists for system keys; the original driver's
+  `findIndexInDefaultMatrix(original,index)` lookup can miss keys whose
+  default quad is not a plain HID.
+- Reset (原驱动 恢复默认): Base single-key reset
+  (`___单按键恢复按键`) writes `[0,0,hid,0]` for the key's original HID;
+  Fn reset (`___恢复fn按键`) calls `setFnKeyConfigSimple` with
+  `original===skey===key===key2`, and that method special-cases such
+  combos to `defaultFnMacMatrix`/`defaultFnMatrix.slice(slot*4, +4)`.
+  Our UI Reset restores the exact factory quad for the current layer:
+  Base from the device `defaultMatrix` (`MATRIX_2518`/`MATRIX_3804`,
+  system quads included), Fn from `defaultFnMatrix`/
+  `defaultFnMacMatrix`. The 2518 module has no mac table; the shared base
+  class (`7a5b12c9.js`) sets `defaultFnMacMatrix = this.defaultFnMatrix`,
+  and both 2518/3804 win tables are byte-identical.
+- Fn defaults added to `src/matrix.rs`: `FN_MATRIX_3804_WIN`,
+  `FN_MATRIX_3804_MAC` (differ at slots 17/18/42/48/54),
+  `FN_MATRIX_2518_WIN`/`_MAC` aliases, plus `default_matrix` /
+  `default_fn_matrix` selectors. `keymap::default_quad` fetches one
+  slot's Base/Fn default. The picker's old Clear button is gone; Reset
+  sits next to Write key and is available for every binding type.
+- CLI: `keymap write` now accepts `--fn win|mac` (ops 16 vs 10) so the
+  Fn path is testable. Live check: Fn-win slot 8 `[14,0,0,0]`
+  (Bluetooth 1) → temp `[3,0,234,0]` read back Volume- → restored
+  `[14,0,0,0]` read back Bluetooth 1. Base slot 15 had been left
+  non-default by earlier tests; writing its default `[0,0,22,0]` cleared
+  the changed marker (S).
+- Tests: `switches::single_write_layout_matches_driver` (code at byte 8,
+  checksum at 7), `matrix::fn_defaults_match_driver_tables`,
+  `matrix::default_matrix_picks_by_device_id`,
+  `keymap::reset_defaults_cover_base_and_fn_layers`; `cargo test`
+  35/35 pass in both binaries.

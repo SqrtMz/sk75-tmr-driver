@@ -110,6 +110,7 @@ cargo run --bin sk75-tmr-ui
 ./target/debug/sk75-tmr keymap write --profile 0 --slot 0 --disable
 ./target/debug/sk75-tmr keymap write --profile 0 --slot 5 --mouse Left
 ./target/debug/sk75-tmr keymap write --profile 0 --slot 5 --function 'Volume+'
+./target/debug/sk75-tmr keymap write --profile 0 --fn win --slot 8 --quad 14,0,0,0
 # Live poll always runs at max speed like the original loop
 ./target/debug/sk75-tmr monitor --seconds 2   # → ~83 Hz measured
 ```
@@ -129,35 +130,79 @@ cargo run --bin sk75-tmr-ui
   pacing, back-to-back polls, no throttle (~83 Hz on real hardware).
 - **Keyboard tab** (combined board + rebinding, live input included, so
   there is no separate Analog tab) — on-screen 81-key board in the
-  original arrangement (positions from its keymap asset): every key
-  visible at once with its label, current binding and live press depth.
+  original arrangement (positions from its keymap asset), centered in
+  the window at ~50% width, each key grown into its inter-key gap.
+  Each key is a card: ORIGINAL cap name on top (direction keys use
+  Nerd-Font arrow glyphs), CURRENT binding value below it (compact
+  `LCtrl+Up` style), red/blue press-release activation travels, and —
+  with the Live input overlay on — the current depth at the very
+  bottom as `mm` + `%` of the 4.0 mm full stroke. Rows are stacked
+  into measured height bands so text cannot overlap at any key size;
+  fonts shrink a step to keep the air. When a key reaches its
+  configured activation point the fill turns black with a red glow
+  radiating around it; live press depth also tints the fill.
   Clicking a key opens its rebind options right below: profile 1–4 and
-  Base/Fn-win/Fn-mac layer selectors (changing either re-reads the
-  keyboard configuration, mirroring `setCurrentProfile` cmd 4),
-  at-a-glance option grids (116 standard keys as buttons from the
+  Base/Fn-win/Fn-mac layer selectors. Profile changes send
+  `setCurrentProfile` (cmd 4) so the keyboard's active profile follows
+  the UI — base-keymap reads are anchored to the ACTIVE profile
+  (firmware-verified) — then fetch a full Read all (bindings +
+  switches + travels + analog snapshot), mirroring
+  `___check当前按键层索引变化` → `setCurrentProfile` →
+  `___获取所有按键信息`; Fn-layer changes only re-read (Fn ops carry
+  the profile byte). At-a-glance option grids: 116 standard keys as buttons from the
   driver's key tables — letters, digits, PrtSc/Scroll/Pause, numpad,
   F13–F24, modifiers; click adds / re-click removes, up to 3 per combo
   mirroring the original `handleClick_组合键` limit; arrow keys shown as
   Nerd-Font icons loaded from
   the system fonts; no HID numbers to type — plus mouse, the original
-  15 media/function entries, gamepad, macro and disabled; Write key
-  auto re-reads and keeps the key selected), per-key
-  switch type across the six SK75 options (op 252), and Write key /
+  15 media/function entries, 65 native Fn functions (the driver's `uw`/
+  master-key-table rows, plus the SK75 connector and LED-cluster quads
+  the driver leaves unnamed: Bluetooth 1/2/3, 2.4 GHz, Wired, Win
+  Lock, Win/Mac Switch, Battery Level, LED Direction-/+, LED
+  Color, LED Speed+/−, Factory Reset — names rest on the
+  factory Fn matrix `74d1dc6b.js`, cross-board family statistics and
+  operator-verified behavior, see `PROTOCOL.md`), gamepad, macro and
+  disabled; Write key
+  auto re-reads and keeps the key selected; Reset restores the selected
+  key's factory binding on the current layer — Base from the device
+  `defaultMatrix`, Fn-win/Fn-mac from `defaultFnMatrix`/
+  `defaultFnMacMatrix`, including system-key quads. Per-key
+  switch type across the six SK75 options, now named `{original driver}
+  - {source}` (Outemu, Magnetic Jade Pro/Gaming, Magneto RGB,
+  POM Magnet King, Void Switch — op 252, axis code at byte 8 of the
+  single-key write), and Write key /
   Write switch actions.
+- **On-screen board preview** — ~50% of the screen width (responsive,
+  no more clipped or over-sized layouts), each key filled with its
+  installed switch's color from the driver's `轴体颜色字典` (the
+  demo's corner switch-number badge stays off per request; the legend
+  below the board maps the colors), and the configured activation
+  travel values exactly where the driver shows them: press bottom-left
+  in red (`#FE4545`, op 0) and release bottom-right in blue (`#0066FF`,
+  op 1) at the very bottom of the key, with the live press depth
+  (mm + % of full stroke, op 254) in its own band directly above them —
+  separated from the original cap and its rebinding by a spacer band.
+  When a key reaches its configured activation point the fill turns
+  black with a red glow radiating around it; live press depth also
+  tints the fill. Hovering a key shows its binding and travels; a
+  legend lists all six switch colors below the board.
 - **Calibration tab** — travel calibration buttons (cmds 28/30,
   same min→max sequence as `行程校准`).
 
 ## Layout
 
 - `src/proto.rs` — checksum, request builders, LE decode, mm conversion.
-- `src/matrix.rs` — both SK75 matrices + HID names.
+- `src/matrix.rs` — both SK75 base matrices, Fn win/mac default matrices,
+  HID names.
 - `src/hid.rs` — hidapi transport + high-level ops (`report_rate_hz` added).
 - `src/device_info.rs` — consolidated info readout shared by CLI + UI.
-- `src/main.rs` — CLI (`list/info/monitor/keymap/switch/calibrate/stream/demo`).
+- `src/main.rs` — CLI (`list/info/monitor/keymap/switch/travel/profile/calibrate/stream/demo`).
 - `src/layout.rs` — 81-key on-screen geometry from the original asset.
-- `src/switches.rs` — SK75 switch table + op-252 read/write.
+- `src/switches.rs` — SK75 switch table (driver-named) + colors + op-252
+  read/write (code at byte 8).
 - `src/keymap.rs` — rebinding: `read_keymap`/`read_fn_keymap` (cmds
   138/144), `write_key_simple`/`write_fn_key_simple` (cmds 10/16),
+  `default_quad` (Base/Fn Reset defaults),
   `Binding` options (Key/Disabled/Mouse/Media/Gamepad/Macro/Special),
   profiles 1–4 + Fn win/mac.
 - `src/ui.rs` — egui UI (`sk75-tmr-ui`: Device info / Keyboard / Calibration).
@@ -171,5 +216,6 @@ cargo run --bin sk75-tmr-ui
   prefers iface 2 / page `0xFFFF` (hidraw3).
 - Wireless (2.4 G/BT) dongle framing (`246/247/252/254`, `85` prefix on BT)
   is not implemented — USB only.
-- No LED/macro/remap write paths beyond analog + calibration (read the
-  JS `setMultiMagnetismInfo` chunking in `PROTOCOL.md` to extend).
+- No LED or macro-content write paths yet (remap + switch writes are
+  implemented; read the JS `setMultiMagnetismInfo` chunking in
+  `PROTOCOL.md` to extend).

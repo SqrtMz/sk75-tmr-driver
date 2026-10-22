@@ -69,6 +69,20 @@ enum Cmd {
         #[command(subcommand)]
         action: SwitchAction,
     },
+    /// Keyboard active profile: read (cmd 132) / set (cmd 4). Profile reads
+    /// and writes are per active profile, exactly like the original driver.
+    Profile {
+        #[command(subcommand)]
+        action: ProfileAction,
+    },
+    /// Read configured per-key activation travel: press (op 0) + release
+    /// (op 1), the values the driver preview shows on each key (red/blue).
+    Travel {
+        #[arg(long, help = "Show all mapped keys, even zero-valued")]
+        all: bool,
+        #[arg(long, help = "Matrix variant: 2518 or 3804 (default: auto by device id)")]
+        matrix: Option<u32>,
+    },
     /// Offline analog-decode demo (no hardware): decode a synthetic op254
     /// blob and print mm values, proving the TMR conversion path.
     Demo,
@@ -76,17 +90,22 @@ enum Cmd {
 
 #[derive(Subcommand)]
 enum KeymapAction {
-    /// Dump a keymap layer: slot, default key, current binding.
+    /// Dump a keymap layer: slot, default key, current binding. Note:
+    /// base-layer reads are anchored to the keyboard's ACTIVE profile (the
+    /// `--profile` byte is not honored) — `profile set N` first for N≠0.
     Read {
-        #[arg(long, default_value_t = 0, help = "Profile/layer 0..3")]
+        #[arg(long, default_value_t = 0, help = "Profile/layer 0..3 (base: active profile)")]
         profile: u8,
         #[arg(long, help = "Fn layer instead: win or mac")]
         r#fn: Option<String>,
     },
-    /// Rebind one key slot (single-key write, mirrors setKeyConfigSimple).
+    /// Rebind one key slot (single-key write, mirrors setKeyConfigSimple /
+    /// setFnKeyConfigSimple; base writes target the active profile).
     Write {
-        #[arg(long, default_value_t = 0, help = "Profile/layer 0..3")]
+        #[arg(long, default_value_t = 0, help = "Profile/layer 0..3 (base: active profile)")]
         profile: u8,
+        #[arg(long, help = "Fn layer instead: win or mac")]
+        r#fn: Option<String>,
         #[arg(long, help = "Matrix slot 0..127 (see read)")]
         slot: usize,
         #[arg(long, num_args(1..=3), value_name = "HID", help = "Combo HIDs 4..231 in press order, e.g. --hid 224 6 for LCtrl+C (max 3, driver limit)")]
@@ -114,9 +133,17 @@ enum SwitchAction {
     Write {
         #[arg(long, help = "Matrix slot 0..127")]
         slot: usize,
-        #[arg(long, help = "Switch label, e.g. 'POM Magnet-King'")]
+        #[arg(long, help = "Switch label, e.g. 'POM Magnet King - POM Magnet-King'")]
         switch: String,
     },
+}
+
+#[derive(Subcommand)]
+enum ProfileAction {
+    /// Show the keyboard's active profile (cmd 132).
+    Read,
+    /// Switch the keyboard's active profile (cmd 4, 0-based; UI shows 1..4).
+    Set { to: u8 },
 }
 
 fn pick_matrix(device_id: Option<u32>, force: Option<u32>) -> &'static [u8; 512] {
@@ -126,10 +153,7 @@ fn pick_matrix(device_id: Option<u32>, force: Option<u32>) -> &'static [u8; 512]
     if let Some(2518) = force {
         return &matrix::MATRIX_2518;
     }
-    match device_id {
-        Some(3804) => &matrix::MATRIX_3804,
-        _ => &matrix::MATRIX_2518, // default: id 2518 layout (both are 128 slots)
-    }
+    matrix::default_matrix(device_id)
 }
 
 fn main() -> Result<()> {
@@ -287,6 +311,7 @@ fn main() -> Result<()> {
             }
             KeymapAction::Write {
                 profile,
+                r#fn,
                 slot,
                 hid,
                 disable,
@@ -299,6 +324,12 @@ fn main() -> Result<()> {
                 if profile > 3 {
                     anyhow::bail!("profile must be 0..3");
                 }
+                let sys = match r#fn.as_deref() {
+                    None => None,
+                    Some(s) if s.eq_ignore_ascii_case("win") => Some(keymap::FnSys::Win),
+                    Some(s) if s.eq_ignore_ascii_case("mac") => Some(keymap::FnSys::Mac),
+                    Some(other) => anyhow::bail!("--fn must be win or mac, got {other}"),
+                };
                 let mut set = 0;
                 let mut binding = None;
                 if !hid.is_empty() {
@@ -362,9 +393,16 @@ fn main() -> Result<()> {
                 }
                 let b = binding.unwrap();
                 let k = hid::open_sk75(cli.vid, cli.pid, cli.path.as_deref(), cli.iface)?;
-                k.write_key_simple(profile, slot, b.quad())?;
+                match sys {
+                    None => k.write_key_simple(profile, slot, b.quad())?,
+                    Some(s) => k.write_fn_key_simple(profile, s, slot, b.quad())?,
+                }
+                let layer = match sys {
+                    None => format!("profile {profile}"),
+                    Some(s) => format!("fn {} profile {profile}", s.label()),
+                };
                 println!(
-                    "slot {slot} profile {profile} -> {} [{},{},{},{}]",
+                    "slot {slot} {layer} -> {} [{},{},{},{}]",
                     b.short_label(),
                     b.quad()[0],
                     b.quad()[1],
@@ -391,6 +429,42 @@ fn main() -> Result<()> {
                 println!("slot {slot} -> {} ({code})", switches::switch_label(code));
             }
         },
+        Cmd::Profile { action } => match action {
+            ProfileAction::Read => {
+                let k = hid::open_sk75(cli.vid, cli.pid, cli.path.as_deref(), cli.iface)?;
+                match k.get_profile()? {
+                    Some(p) => println!("active profile: {} (0-based)", p),
+                    None => anyhow::bail!("no profile in response (check wired vendor channel)"),
+                }
+            }
+            ProfileAction::Set { to } if to <= 3 => {
+                let k = hid::open_sk75(cli.vid, cli.pid, cli.path.as_deref(), cli.iface)?;
+                k.set_profile(to)?;
+                println!("active profile -> {} (0-based)", to);
+            }
+            ProfileAction::Set { .. } => anyhow::bail!("profile must be 0..3"),
+        },
+        Cmd::Travel { all, matrix } => {
+            let k = hid::open_sk75(cli.vid, cli.pid, cli.path.as_deref(), cli.iface)?;
+            let scale = k.travel_scale()?;
+            let (press, lift) = k.press_lift_travel_raw()?;
+            let mat = pick_matrix(k.device_id()?, matrix);
+            println!("# activation travel: slot hid name press release (scale {scale}/mm)");
+            for (slot, h) in matrix::populated_keys(mat) {
+                let p = press.get(slot).copied().unwrap_or(0);
+                let l = lift.get(slot).copied().unwrap_or(0);
+                if !all && p == 0 && l == 0 {
+                    continue;
+                }
+                println!(
+                    "{slot:3} {h:3} {:9} {p:4} {:.digits$}mm {l:4} {:.digits$}mm",
+                    matrix::hid_name(h),
+                    proto::raw_to_mm(p, scale),
+                    proto::raw_to_mm(l, scale),
+                    digits = proto::travel_digits(scale),
+                );
+            }
+        }
         Cmd::Demo => {
             // Synthetic op254 blob: 128 LE u16, Esc=0, A=150 (1.5mm@100), Space=330 (3.3mm max).
             let mut blob = vec![0u8; 256];

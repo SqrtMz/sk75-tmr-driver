@@ -8,7 +8,8 @@
 //! `matrixToConfigs`/`configToMatrix`/`changeArrToConfig`).
 //! REA: `analyze_javascript_application` summary `ev_942b38b6…`
 //! (scoped `7a5b12c9.js`+`15394fe0.js`+`ec0c0cb4.js`) + module page
-//! `ev_4e41ffbf…`.
+//! `ev_4e41ffbf…`. Reset defaults (`default_quad`) were re-confirmed with
+//! parent `ev_f2e38f5e…`, summary `ev_270e853a…`.
 
 use anyhow::Result;
 
@@ -244,14 +245,15 @@ pub const STANDARD_KEYS: [u32; 116] = [
 /// Native keyboard functions: the `uw` function map plus the master key
 /// table's LED/power/MIC/AI rows, all in `dist/js/index.5627ed60.js`
 /// (REA `ev_42330295…`, scoped `index.5627ed60.js`+`59693644.js`,
-/// corroborated by direct static reads of the extracted `app-32.7z` tree).
+/// corroborated by direct static reads of the extracted `app-32.7z` tree),
+/// plus the SK75's own connector/lighting-control Fn quads (round 15).
 /// Only `q[0] != 0` entries are listed: on the read path
 /// (`matrixToConfigs`) the `l[0]===0` combo branch precedes the
 /// function-table lookup, so `q[0]==0` quads such as `[0,0,227,7]` (WIN_D)
 /// decode as combos and display via the join above, like the original board.
 /// Every entry here is also in the Functions picker, so factory Fn
 /// assignments can be replicated onto other keys; bytes round-trip exact.
-const NATIVE_FUNCTIONS: [([u8; 4], &str); 51] = [
+const NATIVE_FUNCTIONS: [([u8; 4], &str); 65] = [
     // Media / launcher extras (`uw`, q0 == 3; Play Alt from master table).
     ([3, 0, 131, 1], "Player"),
     ([3, 0, 36, 2], "Back"),
@@ -321,6 +323,44 @@ const NATIVE_FUNCTIONS: [([u8; 4], &str); 51] = [
     ([10, 12, 0, 0], "Powersave"),
     ([10, 32, 0, 0], "Mic"),
     ([10, 24, 0, 0], "AI"),
+    // SK75 connector / Fn-cluster quads (round 15). Sources across the
+    // extracted app: the SK75 factory Fn default (`74d1dc6b.js`,
+    // `Ry5088_womier_sk75he_europe_3m_8k_8k`) carries every quad of this
+    // block and matches our board's live `keymap read --fn win` row by
+    // row. A full sweep of the app found NO naming table for them
+    // (master key table, `uw`/`fL`, `O_`/`Fa`, per-device modules,
+    // SK75 ui_info `7d1d89fb.js`, help device `fa78cffb.js`, i18n
+    // dictionaries all checked — the original board types them
+    // ConfigUnknown and displays 系统按键/"System"); the names below
+    // rest on cross-board family statistics plus operator-verified
+    // behavior on our unit.
+    // - `[14,0,x]` exists only on three-mode keyboards, five quads
+    //   x=0,1,2,5,6 on Q/W/E/R/T (operator: Bluetooth 1/2/3, 2.4 GHz,
+    //   wired mode switch).
+    // - `[13,5,a,b]` on the arrow cluster (operator: Left `[13,5,0,2]`
+    //   direction-, Right `[13,5,0,1]` direction+, End `[13,5,1,0]`
+    //   LED color change).
+    // - `[13,3,1]/[13,3,2]` on PgDn/PgUp mirror the labelled `[13,2,±]`
+    //   brightness ±-pairs as LED speed (inferred: ± family, same
+    //   cluster; operator confirmed every other cluster key).
+    // - `[10,2,0,0]` factory reset, `[10,3,0,0]` Win-key lock,
+    //   `[10,3,0,0]` Win-key lock, `[10,8,0,0]` battery level, and
+    //   `[10,5,3,0]` Win/Mac mode switch (operator-verified; the
+    //   driver's mouse dict labels only `[10,5,0,0]` as "PAIR").
+    ([14, 0, 0, 0], "Bluetooth 1"),
+    ([14, 0, 1, 0], "Bluetooth 2"),
+    ([14, 0, 2, 0], "Bluetooth 3"),
+    ([14, 0, 5, 0], "2.4 GHz"),
+    ([14, 0, 6, 0], "Wired"),
+    ([13, 3, 1, 0], "LED Speed-"),
+    ([13, 3, 2, 0], "LED Speed+"),
+    ([13, 5, 0, 2], "LED Direction-"),
+    ([13, 5, 0, 1], "LED Direction+"),
+    ([13, 5, 1, 0], "LED Color"),
+    ([10, 2, 0, 0], "Factory Reset"),
+    ([10, 3, 0, 0], "Win Lock"),
+    ([10, 8, 0, 0], "Battery Level"),
+    ([10, 5, 3, 0], "Win/Mac Switch"),
 ];
 
 /// Decode one 4-byte keymap slot (mirrors `matrixToConfigs` branches, including
@@ -477,6 +517,24 @@ impl Sk75 {
     }
 }
 
+/// Factory default 4-byte quad for one slot on a layer.
+///
+/// Base layer: the device's `defaultMatrix` (`MATRIX_2518`/`MATRIX_3804`).
+/// Fn layer: `defaultFnMatrix`/`defaultFnMacMatrix` for the active OS; the
+/// 2518 device has no mac table and the driver's base class falls back to
+/// its win table.
+pub fn default_quad(device_id: Option<u32>, slot: usize, sys: Option<FnSys>) -> Option<[u8; 4]> {
+    if slot > 127 {
+        return None;
+    }
+    let m = match sys {
+        Some(s) => matrix::default_fn_matrix(device_id, s == FnSys::Mac),
+        None => matrix::default_matrix(device_id),
+    };
+    let b = slot * 4;
+    Some([m[b], m[b + 1], m[b + 2], m[b + 3]])
+}
+
 /// Decode a 512 B keymap blob against a default matrix.
 pub fn decode_keymap(blob: &[u8], default_matrix: &[u8; 512]) -> Vec<KeyEntry> {
     let mut out = Vec::new();
@@ -599,16 +657,39 @@ mod tests {
     }
 
     #[test]
-    fn unknown_native_keys_show_system_not_arrays() {
-        // Quads the original types as ConfigUnknown display as system key
-        // (`case"ConfigUnknown":o=s.系统按键`), observed live on Fn win:
-        // Esc `[10,2,0,0]`, Q `[14,0,0,0]`, Left `[13,5,0,2]`.
-        for quad in [[10, 2, 0, 0], [14, 0, 0, 0], [13, 5, 0, 2], [10, 5, 3, 0], [10, 8, 0, 0]] {
+    fn sk75_fn_cluster_quads_are_named_functions() {
+        // Round 15: the SK75 connector/lighting Fn quads that the original
+        // board types ConfigUnknown (系统按键) are named here — SK75 factory
+        // Fn default (`74d1dc6b.js`, matches live `keymap read --fn win`) +
+        // cross-board family statistics + operator-verified behavior.
+        for (quad, label) in [
+            ([14, 0, 0, 0], "Bluetooth 1"),
+            ([14, 0, 1, 0], "Bluetooth 2"),
+            ([14, 0, 2, 0], "Bluetooth 3"),
+            ([14, 0, 5, 0], "2.4 GHz"),
+            ([14, 0, 6, 0], "Wired"),
+            ([13, 3, 1, 0], "LED Speed-"),
+            ([13, 3, 2, 0], "LED Speed+"),
+            ([13, 5, 0, 2], "LED Direction-"),
+            ([13, 5, 0, 1], "LED Direction+"),
+            ([13, 5, 1, 0], "LED Color"),
+            ([10, 2, 0, 0], "Factory Reset"),
+            ([10, 3, 0, 0], "Win Lock"),
+            ([10, 8, 0, 0], "Battery Level"),
+            ([10, 5, 3, 0], "Win/Mac Switch"),
+        ] {
             let b = decode_quad(quad);
-            assert_eq!(b, Binding::Unknown(quad), "{quad:?}");
-            assert_eq!(b.short_label(), "System", "{quad:?}");
-            assert_eq!(b.quad(), quad);
+            assert_eq!(b.short_label(), label, "{quad:?}");
+            assert!(!matches!(b, Binding::Unknown(_)), "{quad:?}");
+            assert_eq!(b.quad(), quad, "{quad:?}");
         }
+        // Genuinely unknown native quads still display as system key
+        // (`case"ConfigUnknown":o=s.系统按键`); e.g. the pair sibling
+        // `[10,5,0,0]` (driver mouse dict "PAIR") not fitted on our board.
+        let b = decode_quad([10, 5, 0, 0]);
+        assert_eq!(b, Binding::Unknown([10, 5, 0, 0]));
+        assert_eq!(b.short_label(), "System");
+        assert_eq!(b.quad(), [10, 5, 0, 0]);
     }
 
     #[test]
@@ -702,6 +783,13 @@ mod tests {
             ("Powersave", [10, 12, 0, 0]),
             ("AI", [10, 24, 0, 0]),
             ("Mic", [10, 32, 0, 0]),
+            // Round 15 connector/cluster names are in the picker as well.
+            ("Bluetooth 1", [14, 0, 0, 0]),
+            ("Bluetooth 2", [14, 0, 1, 0]),
+            ("Bluetooth 3", [14, 0, 2, 0]),
+            ("2.4 GHz", [14, 0, 5, 0]),
+            ("Wired", [14, 0, 6, 0]),
+            ("Win/Mac Switch", [10, 5, 3, 0]),
         ] {
             assert!(
                 opts.iter().any(|(l, q)| l == label && *q == quad),
@@ -726,5 +814,32 @@ mod tests {
             3,
         );
         assert_eq!(&req[0..4], &[229, 254, 1, 3]);
+    }
+
+    #[test]
+    fn reset_defaults_cover_base_and_fn_layers() {
+        // Base layer uses the device defaultMatrix, including system keys.
+        assert_eq!(default_quad(Some(3804), 0, None), Some([0, 0, 41, 0]));
+        assert_eq!(default_quad(Some(3804), 71, None), Some([10, 1, 0, 0]));
+        // Fn layer uses defaultFnMatrix/defaultFnMacMatrix per OS.
+        assert_eq!(
+            default_quad(Some(3804), 18, Some(FnSys::Win)),
+            Some([0, 0, 227, 43])
+        );
+        assert_eq!(
+            default_quad(Some(3804), 18, Some(FnSys::Mac)),
+            Some([0, 224, 82, 0])
+        );
+        // 2518 has no mac table; base class falls back to its win table.
+        assert_eq!(
+            default_quad(Some(2518), 18, Some(FnSys::Mac)),
+            Some([0, 0, 227, 43])
+        );
+        // Unassigned Fn slots reset to the driver's zero entry.
+        assert_eq!(
+            default_quad(Some(3804), 1, Some(FnSys::Win)),
+            Some([0, 0, 0, 0])
+        );
+        assert_eq!(default_quad(Some(3804), 128, None), None);
     }
 }
