@@ -56,7 +56,7 @@ Analog (TMR) commands:
 | `SET_MAGNETISM_REPOR` | 27 | enable streaming (`[27,on]`) |
 | `SET_MAGNETISM_CAL` | 28 | min-travel cal |
 | `SET_MAGNETISM_MAXIMUM_CALIBRATION` | 30 | max-travel cal |
-| `SET_MULTI_MAGNETISM` | 101 | batched per-key config |
+| `SET_MULTI_MAGNETISM` | 101 | per-key config; single-slot write `[101,op,0,slot,last,0,0,ck,lo,hi]` |
 | `GET_MULTI_MAGNETISM` | 229 | `req=[229,op,1,page]` (op + 4 pages for live) |
 | `GET_FEATURE_LIST` | 230 | `resp=[230,0xAA,precision]` |
 | `GET_USB_VERSION` / whoAmI | 143 | `ver=r[8]<<8\|r[7]`, `id=u32 LE r[1..4]` |
@@ -65,6 +65,18 @@ Multi-mag ops (`et`): `TRAVEL=0, LIFT=1, RT_PRESS=2, RT_LIFT=3,
 DYNAMIC_START=4, MT=5, DEADZONE=6, MODE=7, DKS=8, SNAP=9,
 LIVE_TRAVEL=254 (按键按压行程数值), LIVE_DYNAMIC=255 (按键按压动态数值),
 AXIS=252, TOP_DEADZONE=251`.
+
+Activation-travel writes use op `0` (press) and op `1` (release); op `6`
+reads and writes the per-key bottom deadzone. The value is the raw travel
+as u16 LE: `[101,op,0,slot,last,0,0,checksum,lo,hi]`. `last=1` applies
+the queued change, matching `_sendMagnetismInfoSimpleCMD`. **Write key**
+compares the pending values with the last op-0/op-1/op-6 read and sends
+only changed ops in `0,1,6` order, with `last=1` only on the final changed
+op and one 100 ms vendor sleep afterwards; an unchanged key sends no
+travel/deadzone packet. The op-252 switch write is sent separately with
+`last=1` (plus another vendor sleep) only when the switch code changed.
+Op `0`, op `1`, and op `6` reads each return four pages
+(`GET_MULTI_MAGNETISM` op, page 0–3) = 128 u16 LE values.
 
 Live analog = `GET_MULTI_MAGNETISM(254, 4 pages)` → 256 B → 128×u16 LE
 (`_decodeMultiMagnetismTwoByteList`), one slot per matrix position;
@@ -98,13 +110,40 @@ travel calibration are all in the desktop window.
   switch selection. Each key shows its original cap name, current
   binding, configured press/release activation travel (red/blue) and,
   with Live input enabled, the current op-254 depth in mm and % of the
-  4.0 mm full stroke. Live press depth tints the key fill; reaching the
+  4.0 mm physical stroke. Live press depth tints the key fill; reaching the
   configured actuation point turns the fill black with a red glow.
   Clicking a key opens the binding editor below the board: profiles 1–4,
   Base/Fn-win/Fn-mac layers, 116 standard keys, mouse, media/functions,
-  native Fn functions, gamepad, macro and disabled. Write/Reset/Write
-  switch use the same single-key ops as the original driver. Hovering a
-  key shows its slot, binding, travels and live value.
+  native Fn functions, gamepad, macro and disabled. Binding, switch type,
+  travel and deadzone edits stay pending until **Write key** is pressed.
+  **Write key** commits all of them with the same single-key ops as the
+  original driver, then performs a full Read all and keeps the key
+  selected; **Reset** restores the factory binding. Hovering a key shows
+  its slot, binding, travels and live value.
+  The selected key's **Activation travel** controls recreate the
+  original travel panel: a **Press travel** slider (0.1 mm up to full
+  travel minus deadzone, default 2.0 mm), a **Set press and release
+  travel separately** checkbox, and, when enabled, a **Release travel**
+  slider (default 2.8 mm). With the checkbox off, **Write key** writes the
+  Press value to both press and release, exactly like the original
+  driver; with it on, press and release are committed separately. The
+  keyboard stores the two travel values but has no separate-release mode
+  flag, so the checkbox is derived from stored values on every read: on
+  only when `press != release`, off when they are equal or unknown. It
+  remains a control while editing, but no per-key choice is remembered.
+  A **Deadzone** slider edits the per-key op-6 bottom deadzone (default
+  0.3 mm; 0–1.0 mm, or 0–4.0 mm below firmware 768). The travel cap uses
+  the original `get死区()` 0–1.0 mm clamp. Slider movement never touches
+  the device; **Write key** diffs each value against the last read and
+  sends only the changed ops (`0,1,6` order), with `last=1` only on the
+  final changed op and one 100 ms vendor sleep. If nothing changed, no
+  travel/deadzone packet is sent. The switch op 252 is written afterwards
+  with `last=1` only when the selected switch code changed. The keyboard
+  needs about 150–180 ms after the last write before reads return fresh
+  data, so **Write key** waits another 200 ms and the data reads retry if
+  the keyboard echoes the request instead of returning values.
+  Full travel is 3.3 mm for firmware 768+ and 4.0 mm below 768; the RF
+  version takes precedence over USB, as in the original.
 - **Travel Calibration** — the card to the left of the keyboard preview
   starts the original per-key calibration flow. It opens the
   “Keystroke Calibration Operation Guide” and runs the same startup
@@ -115,10 +154,14 @@ travel calibration are all in the desktop window.
   painted with the original `#74EBD5` overlay: partial presses fill
   proportionally at 0.3 opacity; reaching the firmware threshold locks
   the key at 100% height / 0.8 opacity and it stays locked after
-  release. **Finish calibration** is enabled only after every
-  expected key has locked. Finish sends cmd 30 off and keeps the
-  calibrated keys at full travel. Cancel, an error, or closing the
-  window always turns min/max calibration off.
+  release. **Finish calibration** is enabled only after every expected
+  key has locked. Finish sends cmd 30 off, clears the calibration
+  overlay/locks, returns every preview key to its normal switch color,
+  and restores the pre-calibration live-input state. If live input was
+  on, polling resumes and retries for 5 s while a re-enumerated hidraw
+  node settles. The live-input checkbox is disabled while calibration is
+  running. Cancel, an error, or closing the window also restores polling
+  and turns min/max calibration off.
   The threshold matches the original UI:
   `version.rf ?? version.usb`, then `y && y < 768 ? 1 : 300`.
   The Fn key is included via the matrix marker `[10,1,0,0]`
@@ -139,10 +182,12 @@ JS loop and this UI both require the vendor feature-report interface
 
 ## Layout
 
-- `src/proto.rs` — checksum, request builders, LE decode, mm conversion.
+- `src/proto.rs` — checksum, request builders, LE decode, mm conversion,
+  activation-travel limits/defaults and the single-slot travel write.
 - `src/matrix.rs` — both SK75 base matrices, Fn win/mac default matrices,
   HID names.
-- `src/hid.rs` — hidapi transport + high-level ops (`report_rate_hz` added).
+- `src/hid.rs` — hidapi transport + high-level ops (`report_rate_hz`,
+  activation-travel reads/writes, deadzone).
 - `src/device_info.rs` — consolidated info readout used by the UI.
 - `src/layout.rs` — 81-key on-screen geometry from the original asset and
   HID→matrix-slot mapping (including the Fn marker).
@@ -154,8 +199,8 @@ JS loop and this UI both require the vendor feature-report interface
   `Binding` options (Key/Disabled/Mouse/Media/Gamepad/Macro/Special),
   profiles 1–4 + Fn win/mac.
 - `src/ui.rs` — UI entry point and egui implementation (`sk75-tmr-ui`:
-  Device info / Keyboard, including the travel-calibration guide,
-  startup state machine and key overlay).
+  Device info / Keyboard, including the per-key activation-travel editor,
+  travel-calibration guide, startup state machine and key overlay).
 - `udev/99-sk75-tmr.rules` — permissions.
 
 ## Limitations

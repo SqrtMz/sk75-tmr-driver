@@ -44,6 +44,69 @@
 pub const VID_RONGYUAN: u16 = 0x3151; // 12625
 pub const PID_SK75_TMR: u16 = 0x5030; // 20528
 
+/// Per-key activation-travel limits/defaults from the original driver
+/// (`index.5627ed60.js` `createState_行程设置` + `设置按下`/`设置抬起`).
+/// Press/lift minimum is 0.1 mm; defaults are 2.0 / 2.8 mm; the fallback
+/// deadzone is 0.3 mm. Full travel is 3.3 mm for firmware >= 768 and
+/// 4.0 mm below that (`选中按键行程最大值`).
+pub const TRAVEL_MIN_MM: f32 = 0.1;
+pub const TRAVEL_DEFAULT_PRESS_MM: f32 = 2.0;
+pub const TRAVEL_DEFAULT_LIFT_MM: f32 = 2.8;
+pub const TRAVEL_DEFAULT_DEADZONE_MM: f32 = 0.3;
+/// Original `get死区()` clamps the selected key's deadzone to 0..=1 mm
+/// before subtracting it from the slider maximum.
+pub const TRAVEL_MAX_DEADZONE_MM: f32 = 1.0;
+/// The deadzone editor's own maximum is 4 mm below firmware 768
+/// (`createState_行程设置.死区` setter / `get死区最大值`), even though the
+/// travel cap still uses the 0..=1 mm `get死区()` clamp above.
+pub const TRAVEL_MAX_DEADZONE_LEGACY_MM: f32 = 4.0;
+pub const TRAVEL_MAX_MM: f32 = 3.3;
+pub const TRAVEL_MAX_MM_LEGACY: f32 = 4.0;
+
+fn is_legacy_firmware(usb: Option<u16>, rf: Option<u16>) -> bool {
+    matches!(rf.or(usb), Some(v) if v != 0 && v < 768)
+}
+
+/// Full travel for the current firmware. The original prefers the RF
+/// version over USB and uses 4.0 mm only below firmware 768.
+pub fn travel_max_mm(usb: Option<u16>, rf: Option<u16>) -> f32 {
+    if is_legacy_firmware(usb, rf) {
+        TRAVEL_MAX_MM_LEGACY
+    } else {
+        TRAVEL_MAX_MM
+    }
+}
+
+/// Per-key deadzone slider maximum from the original
+/// `createState_行程设置` setter: 4.0 mm below firmware 768, otherwise
+/// 1.0 mm.
+pub fn deadzone_max_mm(usb: Option<u16>, rf: Option<u16>) -> f32 {
+    if is_legacy_firmware(usb, rf) {
+        TRAVEL_MAX_DEADZONE_LEGACY_MM
+    } else {
+        TRAVEL_MAX_DEADZONE_MM
+    }
+}
+
+/// Convert millimetres to raw travel units exactly like the original JS:
+///
+/// ```js
+/// const l = value * get磁轴行程步进倍数();
+/// c = [l & 255, l >> 8];
+/// ```
+///
+/// `value` is a JS double and the bitwise ops truncate toward zero (the
+/// original does not round). The f32 input is first normalised to six
+/// decimal places so decimal constants such as 2.8/3.3 do not lose a unit
+/// to their binary f32 representation; e.g. `0.29 * 100` still truncates
+/// to 28, exactly as the original driver writes it.
+pub fn mm_to_raw(mm: f32, scale: u32) -> u16 {
+    let mm = ((mm as f64) * 1_000_000.0).round() / 1_000_000.0;
+    (mm * scale.max(1) as f64)
+        .trunc()
+        .clamp(0.0, u16::MAX as f64) as u16
+}
+
 /// Vendor-control HID selector used by the old WebHID path (`Qf`):
 /// `{usage:2, usagePage:65535, interfaceNumber:2}` for pid 16391+ etc.
 /// Modern iot_manager path enumerates the same vendor page via
@@ -144,7 +207,12 @@ impl Precision {
 /// Fallback scale from firmware USB/RF version (7a5b12c9.js):
 /// `None=>10, 768<=v<1280=>100, >=1280=>200, else 10`.
 pub fn scale_from_version(usb: Option<u16>, rf: Option<u16>) -> u32 {
-    let v = rf.or(usb);
+    // JS `get磁轴行程步进倍数`: `const n = rf || usb` — a zero RF version
+    // falls back to USB (unlike the calibration threshold's `rf ?? usb`).
+    let v = match rf {
+        Some(n) if n != 0 => Some(n),
+        _ => usb.filter(|n| *n != 0),
+    };
     match v {
         None => 10,
         Some(n) if n >= 768 && n < 1280 => 100,
@@ -203,6 +271,39 @@ pub fn build_get_multi_magnetism(op: u8, page: u8) -> Vec<u8> {
         vec![cmd::GET_MULTI_MAGNETISM, op, 1, page, 0, 0, 0, 0],
         ReportKind::Bit7,
     )
+}
+
+/// Build the original single-slot magnetism write:
+/// `[101, op, 0, slot, last, 0, 0, checksum]` + payload bytes.
+/// JS `_sendMagnetismInfoSimpleCMD(op, slot, last, data)` appends the
+/// payload after the fixed 8-byte header; travel values are two bytes
+/// `[raw & 255, raw >> 8]` and `last=1` applies the change.
+pub fn build_magnetism_simple(op: u8, slot: u8, last: bool, data: &[u8]) -> Vec<u8> {
+    let mut buf = vec![
+        cmd::SET_MULTI_MAGNETISM,
+        op,
+        0,
+        slot,
+        u8::from(last),
+        0,
+        0,
+        0,
+    ];
+    buf.extend_from_slice(data);
+    encode_cmd(buf, ReportKind::Bit7)
+}
+
+/// Build the ordered single-slot write batch used by
+/// `setMagnetismInfoSimple`: every op except the final one gets `last=0`,
+/// the final op gets `last=1` (the only point where the firmware applies
+/// the queued changes).
+pub fn build_magnetism_batch(slot: u8, ops: &[(u8, u16)]) -> Vec<Vec<u8>> {
+    ops.iter()
+        .enumerate()
+        .map(|(i, (op, raw))| {
+            build_magnetism_simple(*op, slot, i + 1 == ops.len(), &raw.to_le_bytes())
+        })
+        .collect()
 }
 
 /// Decode LE u16 list, JS `_decodeMultiMagnetismTwoByteList`.
@@ -316,6 +417,86 @@ mod tests {
         assert_eq!(&p[0..4], &[229, 0, 1, 4]);
         let l = build_get_multi_magnetism(mag_op::LIFT_TRAVEL, 4);
         assert_eq!(&l[0..4], &[229, 1, 1, 4]);
+        let d = build_get_multi_magnetism(mag_op::DEADZONE, 4);
+        assert_eq!(&d[0..4], &[229, 6, 1, 4]);
+    }
+
+    #[test]
+    fn travel_write_layout_matches_simple_command() {
+        // _sendMagnetismInfoSimpleCMD(0, slot, last, [lo, hi]):
+        // [101,0,0,slot,last,0,0,checksum,lo,hi].
+        let press = build_magnetism_simple(mag_op::TRAVEL, 41, false, &200u16.to_le_bytes());
+        assert_eq!(press.len(), 10);
+        assert_eq!(&press[0..5], &[101, 0, 0, 41, 0]);
+        assert_eq!(&press[8..10], &[200, 0]);
+        assert_eq!(press[7], checksum(&press[0..7]));
+
+        let lift = build_magnetism_simple(mag_op::LIFT_TRAVEL, 41, true, &280u16.to_le_bytes());
+        assert_eq!(&lift[0..5], &[101, 1, 0, 41, 1]);
+        assert_eq!(&lift[8..10], &[24, 1]); // 280 = 0x0118
+        assert_eq!(lift[7], checksum(&lift[0..7]));
+    }
+
+    #[test]
+    fn magnetism_batch_applies_only_on_the_final_changed_op() {
+        let batch = build_magnetism_batch(
+            41,
+            &[
+                (mag_op::TRAVEL, 220),
+                (mag_op::LIFT_TRAVEL, 240),
+                (mag_op::DEADZONE, 40),
+            ],
+        );
+        assert_eq!(batch.len(), 3);
+        assert_eq!(&batch[0][0..5], &[101, 0, 0, 41, 0]);
+        assert_eq!(&batch[1][0..5], &[101, 1, 0, 41, 0]);
+        assert_eq!(&batch[2][0..5], &[101, 6, 0, 41, 1]);
+
+        // A single changed op is also the final applying op.
+        let batch = build_magnetism_batch(41, &[(mag_op::LIFT_TRAVEL, 200)]);
+        assert_eq!(&batch[0][0..5], &[101, 1, 0, 41, 1]);
+    }
+
+    #[test]
+    fn deadzone_write_layout_matches_simple_command() {
+        // setMagnetismInfoSimple op 6: deadZoneTravel * scale as u16 LE.
+        let deadzone = build_magnetism_simple(mag_op::DEADZONE, 41, true, &30u16.to_le_bytes());
+        assert_eq!(deadzone.len(), 10);
+        assert_eq!(&deadzone[0..5], &[101, 6, 0, 41, 1]);
+        assert_eq!(&deadzone[8..10], &[30, 0]);
+        assert_eq!(deadzone[7], checksum(&deadzone[0..7]));
+    }
+
+    #[test]
+    fn travel_defaults_and_limits_match_original() {
+        assert!((travel_max_mm(Some(768), None) - 3.3).abs() < 1e-6);
+        assert!((travel_max_mm(Some(1024), Some(900)) - 3.3).abs() < 1e-6);
+        assert!((travel_max_mm(Some(500), None) - 4.0).abs() < 1e-6);
+        assert!((travel_max_mm(Some(1024), Some(500)) - 4.0).abs() < 1e-6);
+        assert!((travel_max_mm(Some(0), None) - 3.3).abs() < 1e-6);
+        assert!((deadzone_max_mm(Some(768), None) - 1.0).abs() < 1e-6);
+        assert!((deadzone_max_mm(Some(500), None) - 4.0).abs() < 1e-6);
+        assert!((deadzone_max_mm(Some(1024), Some(500)) - 4.0).abs() < 1e-6);
+        assert!((deadzone_max_mm(Some(0), None) - 1.0).abs() < 1e-6);
+        assert_eq!(mm_to_raw(TRAVEL_MIN_MM, 100), 10);
+        assert_eq!(mm_to_raw(TRAVEL_DEFAULT_PRESS_MM, 100), 200);
+        assert_eq!(mm_to_raw(TRAVEL_DEFAULT_LIFT_MM, 100), 280);
+        assert_eq!(mm_to_raw(TRAVEL_DEFAULT_DEADZONE_MM, 100), 30);
+        assert_eq!(mm_to_raw(TRAVEL_MAX_DEADZONE_LEGACY_MM, 100), 400);
+    }
+
+    #[test]
+    fn mm_to_raw_truncates_like_js_bitwise_ops() {
+        // JS `(v * scale) & 255` truncates toward zero, not rounds.
+        assert_eq!(mm_to_raw(0.29, 100), 28);
+        assert_eq!(mm_to_raw(1.15, 100), 114);
+        assert_eq!(mm_to_raw(2.01, 100), 200);
+        assert_eq!(mm_to_raw(2.29, 100), 229);
+        // Decimal constants keep their exact integer raw value.
+        assert_eq!(mm_to_raw(2.8, 100), 280);
+        assert_eq!(mm_to_raw(3.3, 100), 330);
+        assert_eq!(mm_to_raw(2.8, 200), 560);
+        assert_eq!(mm_to_raw(2.8, 1000), 2800);
     }
 
     #[test]
@@ -332,6 +513,9 @@ mod tests {
         assert_eq!(scale_from_version(Some(800), None), 100);
         assert_eq!(scale_from_version(Some(1300), None), 200);
         assert_eq!(scale_from_version(Some(500), None), 10);
+        // `rf || usb`: zero RF falls back to USB.
+        assert_eq!(scale_from_version(Some(800), Some(0)), 100);
+        assert_eq!(scale_from_version(Some(0), Some(1300)), 200);
         assert_eq!(Precision::P001.scale(), 100);
         assert_eq!(Precision::P0005.scale(), 200);
         assert_eq!(Precision::P0001.scale(), 1000);

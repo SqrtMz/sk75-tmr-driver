@@ -435,7 +435,9 @@ impl Sk75 {
         let mut out = Vec::with_capacity(512);
         for page in 0..8u8 {
             let req = vec![CMD_GET_KEYMATRIX, profile, 255, page, 0];
-            let r = self.common_msg(&req, ReportKind::Bit7)?;
+            // Keymap responses start with binding quads, so an echoed
+            // request means the keyboard is still applying a write.
+            let r = self.common_msg_data(&req, ReportKind::Bit7)?;
             // Each feature body is 64 B; keymap occupies the first 64 B.
             let take = r.len().min(64);
             out.extend_from_slice(&r[..take]);
@@ -452,7 +454,7 @@ impl Sk75 {
         let mut out = Vec::with_capacity(512);
         for page in 0..8u8 {
             let req = vec![CMD_GET_FN, sys.code(), profile, 255, page, 0];
-            let r = self.common_msg(&req, ReportKind::Bit7)?;
+            let r = self.common_msg_data(&req, ReportKind::Bit7)?;
             let take = r.len().min(64);
             out.extend_from_slice(&r[..take]);
             if take < 64 {

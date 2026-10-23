@@ -134,12 +134,7 @@ impl Sk75 {
             anyhow::bail!("slot {slot} out of range (0..127)");
         }
         let req = build_switch_write(slot as u8, code);
-        self.send_msg_with_timing(
-            &req,
-            crate::proto::ReportKind::Bit7,
-            crate::hid::SEND_DELAY,
-            crate::hid::READ_DELAY,
-        )?;
+        self.send_msg_with_timing(&req, crate::proto::ReportKind::Bit7, crate::hid::SEND_DELAY)?;
         Self::vendor_sleep(None);
         Ok(())
     }

@@ -23,6 +23,9 @@ pub struct KeyboardInfo {
     pub device_id: Option<u32>,
     pub variant: String,
     pub usb_version: Option<u16>,
+    /// Wired-only firmware reports 0 / None; the original uses this before
+    /// USB for travel limits and calibration thresholds.
+    pub rf_version: Option<u16>,
     pub precision_label: Option<String>,
     pub scale: u32,
     pub report_rate_hz: Option<u32>,
@@ -42,6 +45,7 @@ impl KeyboardInfo {
             device_id: None,
             variant: String::from("unknown (offline)"),
             usb_version: None,
+            rf_version: None,
             precision_label: None,
             scale: 100,
             report_rate_hz: None,
@@ -136,10 +140,11 @@ pub fn read_keyboard_info(
     });
     let device_id = dev.device_id().unwrap_or(None);
     let usb_version = dev.usb_version().unwrap_or(None);
+    let rf_version = dev.rf_version().unwrap_or(None);
     let precision = dev.precision().unwrap_or(None);
     let scale = dev
         .travel_scale()
-        .unwrap_or_else(|_| proto::scale_from_version(usb_version.filter(|v| *v != 0), None));
+        .unwrap_or_else(|_| proto::scale_from_version(usb_version.filter(|v| *v != 0), rf_version));
     // Report-rate is best-effort; older firmware may not answer.
     let report_rate_hz = dev.report_rate_hz().unwrap_or(None);
     let (variant, mat) = variant_of(device_id);
@@ -169,6 +174,7 @@ pub fn read_keyboard_info(
         device_id,
         variant,
         usb_version,
+        rf_version,
         precision_label: precision.map(|p| p.label().to_string()),
         scale,
         report_rate_hz,

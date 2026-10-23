@@ -4,8 +4,9 @@
 //! `GearHub`, `dist/js/f70eb088.js` device card with firmware-version +
 //! firmware-upgrade and IOT-version + check-update rows): a device card with a
 //! **read keyboard information** action, plus the on-screen keyboard with
-//! live analog values, rebinding, switch selection and per-key travel
-//! calibration backed by the same `hid`/`proto`/`matrix`/`device_info` code.
+//! live analog values, rebinding, switch selection, pending per-key
+//! travel/deadzone editing and travel calibration backed by the same
+//! `hid`/`proto`/`matrix`/`device_info` code.
 //! REA: `analyze_javascript_application` summary `ev_a9d5046b…`
 //! + module page `ev_43d23e55…`; calibration parent `ev_01e3780a…`.
 
@@ -25,6 +26,59 @@ use std::time::{Duration, Instant};
 enum Tab {
     Device,
     Keyboard,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TravelLimits {
+    min_raw: u16,
+    full_raw: u16,
+    deadzone_raw: u16,
+    /// Effective slider maximum. The original clamps both sliders to
+    /// full travel minus deadzone (`O` in `index.5627ed60.js`).
+    cap_raw: u16,
+}
+
+/// Compute the original driver's travel limits for one key. `deadzone_raw`
+/// is the op-6 value when available; `None` uses the 0.3 mm fallback.
+fn travel_limits(
+    scale: u32,
+    usb: Option<u16>,
+    rf: Option<u16>,
+    deadzone_raw: Option<u16>,
+) -> TravelLimits {
+    let scale = scale.max(1);
+    let min_raw = proto::mm_to_raw(proto::TRAVEL_MIN_MM, scale).max(1);
+    let full_raw = proto::mm_to_raw(proto::travel_max_mm(usb, rf), scale).max(min_raw);
+    let deadzone_raw = deadzone_raw
+        .unwrap_or_else(|| proto::mm_to_raw(proto::TRAVEL_DEFAULT_DEADZONE_MM, scale))
+        // The original `get死区()` clamps the value to 0..=1 mm.
+        .min(proto::mm_to_raw(proto::TRAVEL_MAX_DEADZONE_MM, scale))
+        .min(full_raw);
+    let cap_raw = full_raw.saturating_sub(deadzone_raw).max(min_raw);
+    TravelLimits {
+        min_raw,
+        full_raw,
+        deadzone_raw,
+        cap_raw,
+    }
+}
+
+/// Values committed by **Write key**. With "set separately" off, the single
+/// Press value is written to both ops, exactly like the original
+/// `O` / `设置抬起` setters. With it on, each pending slider value is written
+/// to its own op. Both values are clamped to full travel minus deadzone.
+fn planned_commit_travel(
+    separate: bool,
+    press_raw: u16,
+    lift_raw: u16,
+    cap_raw: u16,
+) -> (u16, u16) {
+    if separate {
+        (press_raw.min(cap_raw), lift_raw.min(cap_raw))
+    } else {
+        let v = press_raw.min(cap_raw);
+        (v, v)
+    }
 }
 
 struct KeyBar {
@@ -67,6 +121,9 @@ struct CalibrationSession {
     message: String,
     min_cal_on: bool,
     max_cal_on: bool,
+    /// Live-overlay state before calibration forced polling off; restored
+    /// on Finish / Cancel / failure.
+    resume_polling: bool,
 }
 
 impl CalibrationSession {
@@ -85,6 +142,7 @@ impl CalibrationSession {
             message: String::new(),
             min_cal_on: false,
             max_cal_on: false,
+            resume_polling: false,
         }
     }
 
@@ -95,11 +153,22 @@ impl CalibrationSession {
         )
     }
 
-    fn overlay_visible(&self) -> bool {
+    /// True while the calibration cards/guide own the workflow.
+    fn is_running(&self) -> bool {
         matches!(
             self.phase,
-            CalibrationPhase::Active | CalibrationPhase::Complete
+            CalibrationPhase::StartingMin
+                | CalibrationPhase::Settling
+                | CalibrationPhase::Ready
+                | CalibrationPhase::Active
         )
+    }
+
+    /// The cyan calibration overlay is an Active-phase-only visualization.
+    /// Once Finish turns max-cal off, the board must return to its normal
+    /// switch colors and live input.
+    fn overlay_visible(&self) -> bool {
+        matches!(self.phase, CalibrationPhase::Active)
     }
 
     fn calibrated_count(&self) -> usize {
@@ -183,6 +252,15 @@ struct App {
     polls: u64,
     poll_window_start: Option<Instant>,
     hz: f64,
+    /// The live loop reuses the scale from the last full read, like the
+    /// original's cached `deviceType.version`; this flag triggers a one-time
+    /// fallback query only if no read has supplied it yet.
+    live_scale_ready: bool,
+    /// After calibration turns max-cal off, the keyboard may re-enumerate.
+    /// Keep live polling enabled and retry for a few seconds instead of
+    /// disabling it on the first open failure.
+    live_retry_until: Option<Instant>,
+    live_retry_at: Option<Instant>,
     last_layer: Option<(u8, u8)>,
     calibration: CalibrationSession,
     // Remap tab state (mirrors driver key-rebind panel: profile/Fn layers,
@@ -205,7 +283,20 @@ struct App {
     // `travelPrecision` getter (decimals of the press-travel step, default 2).
     travel_press: Vec<u16>,
     travel_lift: Vec<u16>,
+    travel_deadzone: Vec<u16>,
     travel_digits: usize,
+    // Selected-key travel editor state. Raw units keep the slider on the
+    // exact firmware step; `travel_edit_slot` detects selection changes.
+    travel_press_edit: u16,
+    travel_lift_edit: u16,
+    travel_deadzone_edit: u16,
+    travel_edit_slot: Option<usize>,
+    /// The firmware stores press and release travel but has no
+    /// "separate release mode" flag. The checkbox is therefore derived from
+    /// the stored values: it is on exactly when press != release. While the
+    /// user is editing, the checkbox remains a normal control; the next read
+    /// or selection change re-derives it from the keyboard state.
+    travel_separate: bool,
     selected_switch: usize,
     switch_msg: String,
 }
@@ -225,6 +316,9 @@ impl App {
             polls: 0,
             poll_window_start: None,
             hz: 0.0,
+            live_scale_ready: false,
+            live_retry_until: None,
+            live_retry_at: None,
             last_layer: None,
             calibration: CalibrationSession::idle(),
             remap_profile: 0,
@@ -239,10 +333,19 @@ impl App {
             remap_macro_type: String::from("repeat_times"),
             remap_macro_idx: 0,
             remap_msg: String::new(),
-            switch_codes: vec![0u8; 128],
+            // Empty until op 252 has actually been read. `.get(slot)` then
+            // returns None, which makes Write key treat the switch as
+            // changed (safe) instead of silently skipping a real write.
+            switch_codes: Vec::new(),
             travel_press: Vec::new(),
             travel_lift: Vec::new(),
+            travel_deadzone: Vec::new(),
             travel_digits: 2,
+            travel_press_edit: 200,
+            travel_lift_edit: 280,
+            travel_deadzone_edit: 30,
+            travel_edit_slot: None,
+            travel_separate: false,
             selected_switch: 0,
             switch_msg: String::new(),
         }
@@ -253,6 +356,82 @@ impl App {
             None
         } else {
             Some(self.path.trim())
+        }
+    }
+
+    fn selected_slot(&self) -> Option<usize> {
+        self.remap_selected
+            .and_then(|i| self.remap_entries.get(i))
+            .map(|e| e.slot)
+    }
+
+    fn travel_limits_for_edit(&self) -> TravelLimits {
+        travel_limits(
+            self.info.scale,
+            self.info.usb_version,
+            self.info.rf_version,
+            Some(self.travel_deadzone_edit),
+        )
+    }
+
+    fn deadzone_max_raw(&self) -> u16 {
+        proto::mm_to_raw(
+            proto::deadzone_max_mm(self.info.usb_version, self.info.rf_version),
+            self.info.scale,
+        )
+    }
+
+    /// Load the selected key's current press/release/deadzone values into the
+    /// pending editor state. Called when selection changes and after a HID
+    /// read. Slider edits themselves never call this.
+    fn sync_travel_editor(&mut self, slot: Option<usize>) {
+        self.travel_edit_slot = slot;
+        let Some(slot) = slot else {
+            self.travel_separate = false;
+            return;
+        };
+        let scale = self.info.scale.max(1);
+        let default_press = proto::mm_to_raw(proto::TRAVEL_DEFAULT_PRESS_MM, scale);
+        let default_lift = proto::mm_to_raw(proto::TRAVEL_DEFAULT_LIFT_MM, scale);
+        let stored_press = self.travel_press.get(slot).copied().filter(|v| *v != 0);
+        let stored_lift = self.travel_lift.get(slot).copied().filter(|v| *v != 0);
+        let press = stored_press.unwrap_or(default_press);
+        let lift = stored_lift.unwrap_or(default_lift);
+        // No mode flag exists on the keyboard. Show "separate" only when the
+        // two stored travels actually differ; an unknown/zero value is not
+        // evidence of a separate release travel.
+        self.travel_separate = match (stored_press, stored_lift) {
+            (Some(p), Some(l)) => p != l,
+            _ => false,
+        };
+        let deadzone = self
+            .travel_deadzone
+            .get(slot)
+            .copied()
+            .unwrap_or_else(|| proto::mm_to_raw(proto::TRAVEL_DEFAULT_DEADZONE_MM, scale))
+            .min(self.deadzone_max_raw());
+        self.travel_deadzone_edit = deadzone;
+        let limits = travel_limits(
+            scale,
+            self.info.usb_version,
+            self.info.rf_version,
+            Some(deadzone),
+        );
+        self.travel_press_edit = press.clamp(limits.min_raw, limits.cap_raw);
+        self.travel_lift_edit = lift.clamp(limits.min_raw, limits.cap_raw);
+    }
+
+    fn restore_polling_after_calibration(&mut self) {
+        self.polling = self.calibration.resume_polling;
+        self.calibration.resume_polling = false;
+        if self.polling {
+            // Max-cal off can re-enumerate the hidraw node. Do not let one
+            // failed open disable live input permanently.
+            self.live_retry_until = Some(Instant::now() + Duration::from_secs(5));
+            self.live_retry_at = None;
+        } else {
+            self.live_retry_until = None;
+            self.live_retry_at = None;
         }
     }
 
@@ -273,6 +452,10 @@ impl App {
             Err(_) => {}
         }
         self.info = read_keyboard_info(self.vid, self.pid, self.path_opt(), None);
+        self.live_scale_ready = self.info.error.is_none()
+            || self.info.precision_label.is_some()
+            || self.info.usb_version.is_some()
+            || self.info.rf_version.is_some();
         self.status = match &self.info.error {
             Some(e) => format!("Read finished with note: {e}"),
             None => String::from("Keyboard information read OK."),
@@ -317,26 +500,61 @@ impl App {
     }
 
     fn poll_once(&mut self) {
+        if let Some(at) = self.live_retry_at {
+            if Instant::now() < at {
+                return;
+            }
+            self.live_retry_at = None;
+        }
         let dev = match hid::open_sk75(self.vid, self.pid, self.path_opt(), None) {
             Ok(d) => d,
             Err(e) => {
+                if self.live_retry_until.is_some_and(|t| Instant::now() < t) {
+                    self.live_retry_at = Some(Instant::now() + Duration::from_millis(120));
+                    self.bars.clear();
+                    self.status =
+                        format!("Waiting for keyboard to reconnect after calibration... ({e:#})");
+                    return;
+                }
+                self.live_retry_until = None;
+                self.live_retry_at = None;
                 self.status = format!("{e:#}. Hint: wired mode + udev/99-sk75-tmr.rules");
                 self.polling = false;
                 return;
             }
         };
-        let scale = dev.travel_scale().unwrap_or(self.info.scale.max(1));
-        self.info.scale = scale;
+        // The original live loop reuses the version-derived scale cached in
+        // `deviceType`; it does not re-read FEA-230 on every poll. Reading
+        // that here with normal 10 ms pacing would roughly halve the live
+        // rate. Fetch it once only when no full read has populated it yet.
+        if !self.live_scale_ready {
+            if let Ok(scale) = dev.travel_scale() {
+                self.info.scale = scale;
+                self.live_scale_ready = true;
+            }
+        }
+        let scale = self.info.scale.max(1);
         // Live loop mirrors getJiaoZhunXinXiLoop: 1 ms HID pacing with
         // no inter-poll sleep, so the rate is HID round-trip bound (~83 Hz).
         let travel = match dev.live_travel_raw() {
             Ok(v) => v,
             Err(e) => {
+                if self.live_retry_until.is_some_and(|t| Instant::now() < t) {
+                    self.live_retry_at = Some(Instant::now() + Duration::from_millis(120));
+                    self.bars.clear();
+                    self.status =
+                        format!("Waiting for keyboard to reconnect after calibration... ({e:#})");
+                    return;
+                }
+                self.live_retry_until = None;
+                self.live_retry_at = None;
                 self.status = format!("Analog read failed: {e:#}");
                 self.polling = false;
                 return;
             }
         };
+        self.live_retry_until = None;
+        self.live_retry_at = None;
         let mat = matrix::default_matrix(self.info.device_id);
         let mut bars = Vec::new();
         for (slot, _) in matrix::populated_keys(mat) {
@@ -387,6 +605,7 @@ impl App {
         ) {
             return;
         }
+        let resume_polling = self.polling;
         self.polling = false;
         let dev = match hid::open_sk75(self.vid, self.pid, self.path_opt(), None) {
             Ok(d) => d,
@@ -395,6 +614,7 @@ impl App {
                 cal.phase = CalibrationPhase::Failed;
                 cal.message = format!("{e:#}. Hint: wired mode + udev/99-sk75-tmr.rules");
                 self.calibration = cal;
+                self.polling = resume_polling;
                 return;
             }
         };
@@ -404,6 +624,9 @@ impl App {
             self.info.usb_version = usb;
         }
         let rf = dev.rf_version().ok().flatten();
+        if rf.is_some() {
+            self.info.rf_version = rf;
+        }
         let threshold = proto::calibration_threshold(usb, rf);
         let device_id = dev.device_id().ok().flatten().or(self.info.device_id);
         if device_id.is_some() {
@@ -427,6 +650,7 @@ impl App {
             ),
             min_cal_on: false,
             max_cal_on: false,
+            resume_polling,
         };
         match dev.set_min_travel_cal(true) {
             Ok(()) => {
@@ -440,6 +664,7 @@ impl App {
                 cal.guide_open = false;
                 cal.message = format!("Min-travel calibration failed: {e:#}");
                 self.calibration = cal;
+                self.polling = resume_polling;
             }
         }
     }
@@ -578,6 +803,12 @@ impl App {
             Ok(()) => String::from("Calibration Complete."),
             Err(e) => format!("Calibration Complete, but max-cal off failed: {e}"),
         };
+        // The overlay is Active-only; clear its locked state so the board
+        // immediately returns to normal switch colors and live fill.
+        self.calibration.raw.fill(0);
+        self.calibration.calibrated.fill(false);
+        self.restore_polling_after_calibration();
+        self.bars.clear();
         self.snapshot_preview();
     }
 
@@ -595,6 +826,8 @@ impl App {
             Ok(()) => String::from("Calibration cancelled; min/max calibration is off."),
             Err(e) => format!("Calibration stopped with an error: {e}"),
         };
+        self.restore_polling_after_calibration();
+        self.bars.clear();
         self.snapshot_preview();
     }
 
@@ -654,10 +887,15 @@ impl App {
         let stop = self.stop_calibration_hardware();
         self.calibration.phase = CalibrationPhase::Failed;
         self.calibration.guide_open = false;
+        self.calibration.raw.fill(0);
+        self.calibration.calibrated.fill(false);
         self.calibration.message = match stop {
             Ok(()) => message,
             Err(e) => format!("{message}; stop failed: {e}"),
         };
+        self.restore_polling_after_calibration();
+        self.bars.clear();
+        self.snapshot_preview();
     }
 
     fn read_remap(&mut self) {
@@ -693,6 +931,7 @@ impl App {
         };
         self.remap_entries = keymap::decode_keymap(&blob, mat);
         self.remap_selected = None;
+        self.sync_travel_editor(None);
         let changed = self.remap_entries.iter().filter(|e| e.changed).count();
         self.remap_msg = format!(
             "Read {} keys ({} remapped) on {}.",
@@ -817,6 +1056,19 @@ impl App {
             _ => binding,
         };
         self.ensure_active_profile();
+        let switch_idx = self.selected_switch.min(switches::SK75_SWITCHES.len() - 1);
+        let (switch_code, switch_label) = switches::SK75_SWITCHES[switch_idx];
+        let deadzone_write = self.travel_deadzone_edit.min(self.deadzone_max_raw());
+        self.travel_deadzone_edit = deadzone_write;
+        let limits = self.travel_limits_for_edit();
+        let press_edit = self.travel_press_edit.clamp(limits.min_raw, limits.cap_raw);
+        let lift_edit = self.travel_lift_edit.clamp(limits.min_raw, limits.cap_raw);
+        self.travel_press_edit = press_edit;
+        self.travel_lift_edit = lift_edit;
+        let (press_write, lift_write) =
+            planned_commit_travel(self.travel_separate, press_edit, lift_edit, limits.cap_raw);
+        let quad = binding.quad();
+        let binding_label = binding.short_label();
         let dev = match hid::open_sk75(self.vid, self.pid, self.path_opt(), None) {
             Ok(d) => d,
             Err(e) => {
@@ -824,32 +1076,103 @@ impl App {
                 return;
             }
         };
-        let res = if self.remap_fn == 0 {
-            dev.write_key_simple(self.remap_profile, slot, binding.quad())
+        let binding_res = if self.remap_fn == 0 {
+            dev.write_key_simple(self.remap_profile, slot, quad)
         } else {
             let sys = if self.remap_fn == 2 {
                 keymap::FnSys::Mac
             } else {
                 keymap::FnSys::Win
             };
-            dev.write_fn_key_simple(self.remap_profile, sys, slot, binding.quad())
+            dev.write_fn_key_simple(self.remap_profile, sys, slot, quad)
         };
-        match res {
-            Ok(()) => {
-                let q = binding.quad();
-                let written = format!(
-                    "Slot {slot} -> {} [{},{},{},{}]",
-                    binding.short_label(),
-                    q[0],
-                    q[1],
-                    q[2],
-                    q[3]
-                );
-                // Fetch Read-all state automatically; keep the key selected.
-                self.refresh_keep_selected(slot, &written);
-            }
-            Err(e) => self.remap_msg = format!("Write failed: {e:#}"),
+        if let Err(e) = binding_res {
+            self.remap_msg = format!("Binding write failed: {e:#}");
+            return;
         }
+        // The original keeps the key model loaded by the last read and
+        // sends only values that differ. If a field was never read it is
+        // unknown (not "unchanged") and is therefore written.
+        let previous_travel = hid::TravelState {
+            press: self.travel_press.get(slot).copied(),
+            lift: self.travel_lift.get(slot).copied(),
+            deadzone: self.travel_deadzone.get(slot).copied(),
+        };
+        let desired_travel = hid::TravelState {
+            press: Some(press_write),
+            lift: Some(lift_write),
+            deadzone: Some(deadzone_write),
+        };
+        let travel_ops = match dev.write_magnetism(slot, previous_travel, desired_travel) {
+            Ok(ops) => ops,
+            Err(e) => {
+                self.remap_msg = format!("Travel/deadzone write failed: {e:#}");
+                return;
+            }
+        };
+        // `setMagnetismInfoSimple` writes op 252 only when 轴体 changed.
+        let switch_changed = self.switch_codes.get(slot).copied() != Some(switch_code);
+        if switch_changed {
+            if let Err(e) = dev.write_switch_type(slot, switch_code) {
+                self.remap_msg = format!("Switch write failed: {e:#}");
+                return;
+            }
+        }
+        drop(dev);
+
+        // Hardware-measured: after the final write the keyboard needs about
+        // 150-180 ms before GET_FEATURE stops echoing the request and returns
+        // fresh state. The 100 ms vendor sleep inside the write covers only
+        // part of that window; without this extra settle the post-write
+        // keymap/switch/travel reads can capture the echo as random data.
+        std::thread::sleep(hid::POST_WRITE_SETTLE);
+        // The original commits the whole selected-key panel, then refreshes
+        // its device model. Do one full Read-all and reselect the same key.
+        self.read_all_keep_selected(slot);
+
+        let binding_ok = self
+            .remap_entries
+            .iter()
+            .find(|e| e.slot == slot)
+            .map(|e| e.binding.quad() == quad)
+            .unwrap_or(false);
+        let switch_ok = self.switch_codes.get(slot).copied() == Some(switch_code);
+        let press_ok = self.travel_press.get(slot).copied() == Some(press_write);
+        let lift_ok = self.travel_lift.get(slot).copied() == Some(lift_write);
+        let deadzone_ok = self.travel_deadzone.get(slot).copied() == Some(deadzone_write);
+        let verified = binding_ok && switch_ok && press_ok && lift_ok && deadzone_ok;
+        let scale = self.info.scale.max(1);
+        let digits = self.travel_digits.max(1);
+        let travel_note = if travel_ops.is_empty() {
+            String::from("no travel/deadzone changes")
+        } else {
+            format!("travel/deadzone ops {travel_ops:?}")
+        };
+        let switch_note = if switch_changed { "" } else { " (unchanged)" };
+        let written = format!(
+            "binding {} [{},{},{},{}], switch {} ({}){switch_note}, press {:.digits$} mm, release {:.digits$} mm, deadzone {:.digits$} mm; {travel_note}",
+            binding_label,
+            quad[0],
+            quad[1],
+            quad[2],
+            quad[3],
+            switch_label,
+            switch_code,
+            proto::raw_to_mm(press_write, scale),
+            proto::raw_to_mm(lift_write, scale),
+            proto::raw_to_mm(deadzone_write, scale),
+        );
+        self.remap_msg = if verified {
+            format!(
+                "Slot {slot}: all pending settings written. Read all refreshed; verified by read-back."
+            )
+        } else {
+            format!(
+                "Slot {slot}: all pending settings written. Read all refreshed; read-back differs."
+            )
+        };
+        let read_status = std::mem::take(&mut self.switch_msg);
+        self.switch_msg = format!("Slot {slot}: {written}. {read_status}");
     }
 
     /// Restore the selected key's factory binding, mirroring the original
@@ -926,6 +1249,16 @@ impl App {
         self.remap_msg = format!("{written}. Verified by re-read.");
     }
 
+    /// **Write key** success path: fetch the full Read-all state, then restore
+    /// the same key selection and re-seed every picker from the device.
+    fn read_all_keep_selected(&mut self, slot: usize) {
+        self.read_info();
+        if let Some(i) = self.remap_entries.iter().position(|e| e.slot == slot) {
+            self.remap_selected = Some(i);
+            select_entry(self, i);
+        }
+    }
+
     /// Driver `___check当前按键层索引变化`: the profile (当前按键层) selector
     /// sends `setCurrentProfile` (cmd 4) so the keyboard's *active* profile
     /// follows the UI before any per-profile read/write. Without this the
@@ -956,11 +1289,10 @@ impl App {
                     if let Some(i) = self.remap_selected {
                         if let Some(e) = self.remap_entries.get(i) {
                             let code = codes.get(e.slot).copied().unwrap_or(0);
-                            if let Some(pos) =
-                                switches::SK75_SWITCHES.iter().position(|(c, _)| *c == code)
-                            {
-                                self.selected_switch = pos;
-                            }
+                            self.selected_switch = switches::SK75_SWITCHES
+                                .iter()
+                                .position(|(c, _)| *c == code)
+                                .unwrap_or(0);
                         }
                     }
                     self.switch_codes = codes;
@@ -973,73 +1305,43 @@ impl App {
         self.read_travels();
     }
 
-    /// Configured per-key activation travel (op 0 press / op 1 release),
-    /// the values the driver preview prints on every key. Refreshed together
-    /// with the switch types, mirroring `getMultiMagnetismInfo`.
-    fn read_travels(&mut self) {
+    /// Configured per-key activation travel (op 0 press / op 1 release) and
+    /// deadzone (op 6), the values the driver preview prints on every key and
+    /// uses to clamp release travel. Refreshed together with the switch
+    /// types, mirroring `getMultiMagnetismInfo`.
+    fn read_travels(&mut self) -> bool {
         let Ok(dev) = hid::open_sk75(self.vid, self.pid, self.path_opt(), None) else {
-            return;
+            return false;
         };
         let scale = dev.travel_scale().unwrap_or(self.info.scale.max(1));
         self.info.scale = scale;
+        self.live_scale_ready = true;
         self.travel_digits = proto::travel_digits(scale);
+        let mut ok = false;
         match dev.press_lift_travel_raw() {
             Ok((p, l)) => {
                 self.travel_press = p;
                 self.travel_lift = l;
                 self.switch_msg
                     .push_str(" Activation travels read (ops 0/1).");
+                ok = true;
             }
             Err(e) => self
                 .switch_msg
                 .push_str(&format!(" Travel read failed: {e:#}")),
         }
-    }
-
-    fn apply_switch(&mut self) {
-        let slot = match self.remap_selected {
-            Some(i) => match self.remap_entries.get(i) {
-                Some(e) => e.slot,
-                None => {
-                    self.switch_msg = String::from("Select a key first.");
-                    return;
-                }
-            },
-            None => {
-                self.switch_msg = String::from("Select a key first.");
-                return;
+        match dev.deadzone_travel_raw() {
+            Ok(d) => {
+                self.travel_deadzone = d;
+                self.switch_msg.push_str(" Deadzones read (op 6).");
             }
-        };
-        let (code, label) = switches::SK75_SWITCHES[self.selected_switch.min(5)];
-        self.ensure_active_profile();
-        match hid::open_sk75(self.vid, self.pid, self.path_opt(), None) {
-            Ok(dev) => match dev.write_switch_type(slot, code) {
-                Ok(()) => {
-                    drop(dev);
-                    // Read back like Write key: the old packet wrote code 0
-                    // and still reported success, so verify persistence.
-                    self.read_switches();
-                    let actual = self.switch_codes.get(slot).copied().unwrap_or(0);
-                    if let Some(pos) = switches::SK75_SWITCHES
-                        .iter()
-                        .position(|(c, _)| *c == actual)
-                    {
-                        self.selected_switch = pos;
-                    }
-                    self.switch_msg = if actual == code {
-                        format!("Slot {slot} switch -> {label} ({code}). Verified by re-read.")
-                    } else {
-                        format!(
-                            "Slot {slot} write returned {code}, but re-read shows {} ({}).",
-                            switches::switch_display(actual),
-                            actual
-                        )
-                    };
-                }
-                Err(e) => self.switch_msg = format!("Switch write failed: {e:#}"),
-            },
-            Err(e) => self.switch_msg = format!("{e:#}"),
+            Err(e) => self
+                .switch_msg
+                .push_str(&format!(" Deadzone read failed: {e:#}")),
         }
+        let selected = self.selected_slot();
+        self.sync_travel_editor(selected);
+        ok
     }
 }
 
@@ -1054,7 +1356,13 @@ impl eframe::App for App {
             // No inter-poll sleep: poll every frame and repaint continuously
             // for the max HID-bound rate, like the original live loop.
             self.poll_once();
-            ctx.request_repaint();
+            if self.live_retry_at.is_some() {
+                // Re-enumeration after calibration: retry at 120 ms instead
+                // of spinning on hidapi enumeration every frame.
+                ctx.request_repaint_after(Duration::from_millis(120));
+            } else {
+                ctx.request_repaint();
+            }
         }
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -1145,10 +1453,16 @@ fn keyboard_tab(ui: &mut egui::Ui, app: &mut App) {
                 ui.selectable_value(&mut app.remap_fn, 1, "Fn win");
                 ui.selectable_value(&mut app.remap_fn, 2, "Fn mac");
             });
-        if ui.button("Read all (info + bindings + switches)").clicked() {
+        if ui
+            .button("Read all (info + bindings + switches + travel)")
+            .clicked()
+        {
             app.read_info();
         }
-        ui.checkbox(&mut app.polling, "Live input overlay (max speed)");
+        ui.add_enabled(
+            !app.calibration.is_running(),
+            egui::Checkbox::new(&mut app.polling, "Live input overlay (max speed)"),
+        );
     });
     // Re-read the keyboard configuration whenever profile/layer changes,
     // mirroring the original driver's layer switch (setCurrentProfile cmd 4).
@@ -1644,6 +1958,14 @@ fn text_on(fill: egui::Color32) -> egui::Color32 {
     }
 }
 
+#[cfg(test)]
+fn set_travel_slot(values: &mut Vec<u16>, slot: usize, raw: u16) {
+    if values.len() <= slot {
+        values.resize(slot + 1, 0);
+    }
+    values[slot] = raw;
+}
+
 /// Select a key entry and preseed the binding editors from its current binding.
 fn select_entry(app: &mut App, i: usize) {
     app.remap_selected = Some(i);
@@ -1664,11 +1986,12 @@ fn select_entry(app: &mut App, i: usize) {
         keymap::Binding::Macro { .. } => app.remap_bind_type = String::from("Macro"),
         _ => app.remap_bind_type = String::from("Key"),
     }
-    if let Some(code) = app.switch_codes.get(e.slot).copied() {
-        if let Some(pos) = switches::SK75_SWITCHES.iter().position(|(c, _)| *c == code) {
-            app.selected_switch = pos;
-        }
-    }
+    let code = app.switch_codes.get(e.slot).copied().unwrap_or(0);
+    app.selected_switch = switches::SK75_SWITCHES
+        .iter()
+        .position(|(c, _)| *c == code)
+        .unwrap_or(0);
+    app.sync_travel_editor(Some(e.slot));
 }
 
 /// Rebinding editor for the board-selected key. Clicking the key shows its
@@ -1803,30 +2126,39 @@ fn binding_editor(ui: &mut egui::Ui, app: &mut App) {
         }
     }
     let current_code = app.switch_codes.get(entry.slot).copied().unwrap_or(0);
+    let selected_switch = app.selected_switch.min(switches::SK75_SWITCHES.len() - 1);
+    let (selected_code, selected_label) = switches::SK75_SWITCHES[selected_switch];
     ui.horizontal(|ui| {
         ui.label("Switch type");
         egui::ComboBox::from_id_salt("switch")
-            .selected_text(
-                switches::SK75_SWITCHES
-                    .get(app.selected_switch)
-                    .map(|(_, label)| *label)
-                    .unwrap_or("Unknown"),
-            )
+            .selected_text(selected_label)
             .show_ui(ui, |ui| {
                 for (idx, (_, label)) in switches::SK75_SWITCHES.iter().enumerate() {
                     ui.selectable_value(&mut app.selected_switch, idx, *label);
                 }
             });
-        ui.small(format!(
-            "current: {}",
-            switches::switch_display(current_code)
-        ));
-        if ui.button("Write switch").clicked() {
-            app.apply_switch();
-        }
+        ui.small(if selected_code == current_code {
+            format!(
+                "current: {}; committed by Write key",
+                switches::switch_display(current_code)
+            )
+        } else {
+            format!(
+                "current: {}; pending: {}; Write key commits",
+                switches::switch_display(current_code),
+                selected_label
+            )
+        });
     });
+    travel_editor(ui, app, entry.slot);
     ui.horizontal(|ui| {
-        if ui.button("Write key").clicked() {
+        if ui
+            .button("Write key")
+            .on_hover_text(
+                "Commit the binding, switch type, press/release travel and deadzone, then refresh Read all",
+            )
+            .clicked()
+        {
             app.apply_remap();
         }
         if ui
@@ -1841,6 +2173,96 @@ fn binding_editor(ui: &mut egui::Ui, app: &mut App) {
     if !app.switch_msg.is_empty() {
         ui.small(&app.switch_msg);
     }
+}
+
+/// Per-key press/release activation travel and bottom deadzone, recreated
+/// from the original "设置按键触发键程" panel: one Press slider by default,
+/// and a "设置按下抬起触发行程" toggle that exposes a separate Release
+/// slider. Every edit is pending until **Write key**. Travel is capped at
+/// full travel minus the selected key's deadzone, matching the original
+/// `设置抬起` / `O` clamp.
+fn travel_editor(ui: &mut egui::Ui, app: &mut App, slot: usize) {
+    if app.travel_edit_slot != Some(slot) {
+        app.sync_travel_editor(Some(slot));
+    }
+    let limits = app.travel_limits_for_edit();
+    let deadzone_max = app.deadzone_max_raw();
+    let scale = app.info.scale.max(1);
+    let digits = app.travel_digits.max(1);
+    let fmt = move |v: f64, _: std::ops::RangeInclusive<usize>| {
+        format!("{:.*} mm", digits, v / f64::from(scale))
+    };
+    ui.separator();
+    ui.heading("Activation travel");
+    ui.small("Slider edits stay pending; Write key commits them with the binding and switch type.");
+    ui.small(format!(
+        "Full travel {:.digits$} mm, deadzone {:.digits$} mm; press and release are capped at {:.digits$} mm.",
+        proto::raw_to_mm(limits.full_raw, scale),
+        proto::raw_to_mm(limits.deadzone_raw, scale),
+        proto::raw_to_mm(limits.cap_raw, scale),
+    ));
+    ui.spacing_mut().slider_width = 220.0;
+
+    let mut press = app.travel_press_edit.clamp(limits.min_raw, limits.cap_raw);
+    ui.horizontal(|ui| {
+        ui.label(if app.travel_separate {
+            "Press travel"
+        } else {
+            "Press travel (also release)"
+        });
+        ui.add(
+            egui::Slider::new(&mut press, limits.min_raw..=limits.cap_raw)
+                .step_by(1.0)
+                .custom_formatter(fmt),
+        );
+    });
+    app.travel_press_edit = press;
+
+    ui.checkbox(
+        &mut app.travel_separate,
+        "Set press and release travel separately",
+    )
+    .on_hover_text(
+        "The keyboard has no mode flag. On read/selection change this is derived from the stored values: on when press != release, off when they are equal. Off: Write key sends the Press value to both press and release, like the original driver. On: press and release are committed separately.",
+    );
+    if app.travel_separate {
+        let mut lift = app.travel_lift_edit.clamp(limits.min_raw, limits.cap_raw);
+        ui.horizontal(|ui| {
+            ui.label("Release travel");
+            ui.add(
+                egui::Slider::new(&mut lift, limits.min_raw..=limits.cap_raw)
+                    .step_by(1.0)
+                    .custom_formatter(fmt),
+            );
+        });
+        app.travel_lift_edit = lift;
+    }
+
+    let mut deadzone = app.travel_deadzone_edit.min(deadzone_max);
+    let mut deadzone_changed = false;
+    ui.horizontal(|ui| {
+        ui.label("Deadzone");
+        let resp = ui.add(
+            egui::Slider::new(&mut deadzone, 0..=deadzone_max)
+                .step_by(1.0)
+                .custom_formatter(fmt),
+        );
+        deadzone_changed = resp.changed();
+    });
+    if deadzone_changed {
+        app.travel_deadzone_edit = deadzone;
+        let limits = app.travel_limits_for_edit();
+        app.travel_press_edit = app.travel_press_edit.clamp(limits.min_raw, limits.cap_raw);
+        app.travel_lift_edit = app.travel_lift_edit.clamp(limits.min_raw, limits.cap_raw);
+    }
+    ui.small(format!(
+        "Bottom deadzone range 0–{:.digits$} mm (default {:.digits$} mm); it is committed by Write key.",
+        proto::raw_to_mm(deadzone_max, scale),
+        proto::raw_to_mm(
+            proto::mm_to_raw(proto::TRAVEL_DEFAULT_DEADZONE_MM, scale),
+            scale
+        ),
+    ));
 }
 
 /// The calibration option to the left of the board. It is the entry point
@@ -1919,9 +2341,7 @@ fn calibration_panel(ui: &mut egui::Ui, app: &mut App) {
                         "Calibration Complete",
                     );
                     let total = app.calibration.expected.len();
-                    ui.label(format!(
-                        "{total} / {total} keys are locked at full travel."
-                    ));
+                    ui.label(format!("{total} keys calibrated at full travel."));
                     ui.add_space(4.0);
                     if ui.button("Calibrate again").clicked() {
                         app.begin_travel_calibration();
@@ -2069,14 +2489,179 @@ mod tests {
     }
 
     #[test]
-    fn calibration_overlay_is_hidden_outside_active_or_complete() {
+    fn calibration_overlay_is_active_only() {
         let mut c = active_session(300, vec![0]);
         c.raw[0] = 300;
         c.observe();
         c.phase = CalibrationPhase::Ready;
         assert_eq!(c.overlay_for(0), None);
-        c.phase = CalibrationPhase::Complete;
+        c.phase = CalibrationPhase::Active;
         assert_eq!(c.overlay_for(0), Some((true, 1.0)));
+        // Finish turns max-cal off: the board must return to normal live
+        // colors even though the keys remain recorded as calibrated.
+        c.phase = CalibrationPhase::Complete;
+        assert_eq!(c.overlay_for(0), None);
+        assert!(!c.overlay_visible());
+    }
+
+    #[test]
+    fn calibration_is_running_until_finish_or_failure() {
+        let mut c = CalibrationSession::idle();
+        assert!(!c.is_running());
+        for phase in [
+            CalibrationPhase::StartingMin,
+            CalibrationPhase::Settling,
+            CalibrationPhase::Ready,
+            CalibrationPhase::Active,
+        ] {
+            c.phase = phase;
+            assert!(c.is_running());
+        }
+        c.phase = CalibrationPhase::Complete;
+        assert!(!c.is_running());
+        c.phase = CalibrationPhase::Failed;
+        assert!(!c.is_running());
+    }
+
+    #[test]
+    fn travel_limits_use_full_travel_minus_deadzone() {
+        let l = travel_limits(100, Some(768), None, Some(30));
+        assert_eq!(l.min_raw, 10); // 0.10 mm
+        assert_eq!(l.full_raw, 330); // 3.30 mm
+        assert_eq!(l.deadzone_raw, 30); // 0.30 mm
+        assert_eq!(l.cap_raw, 300); // 3.00 mm
+        let old = travel_limits(100, Some(767), None, Some(30));
+        assert_eq!(old.full_raw, 400);
+        assert_eq!(old.cap_raw, 370);
+        let fallback = travel_limits(100, Some(768), None, None);
+        assert_eq!(fallback.deadzone_raw, 30);
+        // Original get死区() clamps the per-key deadzone to 1 mm.
+        let clamped = travel_limits(100, Some(768), None, Some(250));
+        assert_eq!(clamped.deadzone_raw, 100);
+        assert_eq!(clamped.cap_raw, 230);
+    }
+
+    #[test]
+    fn commit_with_separate_off_writes_both_same_and_clamps_to_cap() {
+        // Press 3.30 mm -> both clamped to the 3.00 mm cap.
+        assert_eq!(planned_commit_travel(false, 330, 280, 300), (300, 300));
+        // Normal press writes the same release value.
+        assert_eq!(planned_commit_travel(false, 250, 280, 300), (250, 250));
+    }
+
+    #[test]
+    fn commit_with_separate_on_keeps_each_value() {
+        assert_eq!(planned_commit_travel(true, 250, 280, 300), (250, 280));
+        // Release is clamped independently to the cap.
+        assert_eq!(planned_commit_travel(true, 250, 330, 300), (250, 300));
+    }
+
+    #[test]
+    fn write_key_diffs_against_last_read_state() {
+        let previous = hid::TravelState {
+            press: Some(200),
+            lift: Some(280),
+            deadzone: Some(30),
+        };
+        // Toggle off with unchanged Press: the single slider implies release
+        // 200, so only op 1 is actually sent (the original setter compares
+        // with the loaded model).
+        let (press, lift) = planned_commit_travel(false, 200, 280, 300);
+        let desired = hid::TravelState {
+            press: Some(press),
+            lift: Some(lift),
+            deadzone: Some(30),
+        };
+        assert_eq!(
+            hid::changed_travel_ops(previous, desired),
+            vec![(proto::mag_op::LIFT_TRAVEL, 200)]
+        );
+
+        // Changing every field sends 0, 1, 6 in that order.
+        let desired = hid::TravelState {
+            press: Some(220),
+            lift: Some(240),
+            deadzone: Some(40),
+        };
+        assert_eq!(
+            hid::changed_travel_ops(previous, desired),
+            vec![
+                (proto::mag_op::TRAVEL, 220),
+                (proto::mag_op::LIFT_TRAVEL, 240),
+                (proto::mag_op::DEADZONE, 40)
+            ]
+        );
+    }
+
+    #[test]
+    fn release_mode_is_derived_from_stored_travels_only() {
+        let mut app = App::new();
+        app.info.scale = 100;
+        app.info.usb_version = Some(800);
+        app.info.rf_version = None;
+        set_travel_slot(&mut app.travel_press, 41, 150);
+        set_travel_slot(&mut app.travel_lift, 41, 250);
+        set_travel_slot(&mut app.travel_deadzone, 41, 20);
+
+        app.sync_travel_editor(Some(41));
+        assert!(app.travel_separate, "stored press != release infers on");
+        assert_eq!(app.travel_press_edit, 150);
+        assert_eq!(app.travel_lift_edit, 250);
+        assert_eq!(app.travel_deadzone_edit, 20);
+
+        // Equal stored travels always show the mode as off, even if the user
+        // toggled it on before the read/selection sync.
+        set_travel_slot(&mut app.travel_press, 41, 200);
+        set_travel_slot(&mut app.travel_lift, 41, 200);
+        app.travel_separate = true;
+        app.sync_travel_editor(Some(41));
+        assert!(!app.travel_separate);
+
+        // Missing values are not evidence of separate press/release travel.
+        app.travel_press.clear();
+        app.travel_lift.clear();
+        app.travel_separate = true;
+        app.sync_travel_editor(Some(41));
+        assert!(!app.travel_separate);
+    }
+
+    #[test]
+    fn deadzone_editor_uses_firmware_specific_max() {
+        let mut app = App::new();
+        app.info.scale = 100;
+        app.info.usb_version = Some(800);
+        app.info.rf_version = None;
+        set_travel_slot(&mut app.travel_deadzone, 41, 250);
+
+        app.sync_travel_editor(Some(41));
+        assert_eq!(app.deadzone_max_raw(), 100);
+        assert_eq!(app.travel_deadzone_edit, 100, "modern max is 1.0 mm");
+
+        app.info.usb_version = Some(500);
+        app.sync_travel_editor(Some(41));
+        assert_eq!(app.deadzone_max_raw(), 400);
+        assert_eq!(app.travel_deadzone_edit, 250, "2.5 mm valid below 768");
+
+        set_travel_slot(&mut app.travel_deadzone, 41, 500);
+        app.sync_travel_editor(Some(41));
+        assert_eq!(app.travel_deadzone_edit, 400, "legacy max is 4.0 mm");
+    }
+
+    #[test]
+    fn finish_restores_pre_calibration_polling() {
+        let mut app = App::new();
+        app.polling = false;
+        app.calibration.resume_polling = true;
+        app.restore_polling_after_calibration();
+        assert!(app.polling);
+        assert!(!app.calibration.resume_polling);
+        assert!(app.live_retry_until.is_some());
+
+        let mut idle = App::new();
+        idle.calibration.resume_polling = false;
+        idle.restore_polling_after_calibration();
+        assert!(!idle.polling);
+        assert!(idle.live_retry_until.is_none());
     }
 }
 

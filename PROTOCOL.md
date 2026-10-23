@@ -17,7 +17,19 @@
   (`package.json` `WOMIER Driver 3.2.15`, `APPVersion.json` IOT 222,
   `dist-electron/main.js`, `iot_manager/*.exe`, `dist/js/*.js`).
 - `keyboard-firmware-installer.exe` (`f148c32a…`, 20 MiB, `ry_upgrade`)
-  is the separate firmware updater, not the driver.
+  is the separate firmware updater, not the driver. REA
+  `inspect_artifact` (`ev_f7fea484…`) + `inspect_rust_binary`
+  (`ev_24dd88d0…`) + `inspect_pe_resources` (`ev_e3099370…`) identify a
+  PE32 i386 Rust/Slint build with no `.dep-v0` (MSVC, not auditable) and
+  only an icon resource. Strings (shell corroboration) expose
+  `src/store/hall_store.rs` callbacks `on_set_travel` and
+  `on_calibrate_travel` plus `on_start_report`/`on_stop_report`, and
+  upgrade modules `keyboard8k.rs`, `ry5088.rs`, `ch585ms.rs`. Native
+  decompilation of `on_set_travel` was blocked: Hopper's bridge timed out
+  waiting for readiness, and Ghidra/IDA/rizin are unconfigured. The
+  installer therefore corroborates the travel/calibration feature naming
+  but does not provide a second wire-level implementation; the write
+  semantics below come from the shipped driver JS.
 
 ## REA calls (this session)
 
@@ -628,3 +640,171 @@ Tests: `proto::calibration_threshold_matches_driver`,
 `layout::fn_maps_to_extended_marker_slot`,
 `layout::every_layout_key_has_a_unique_slot`, and the `ui::tests`
 locking/threshold/all-key/gating/overlay tests.
+
+## Per-key activation travel + calibration completion (2026-10-22)
+
+REA `analyze_javascript_application` scoped to `index.5627ed60.js`,
+`7a5b12c9.js`, and `60ee4367.js` produced parent
+`ev_08733d6da723c1075eb5a3f4c55af41a5b60cc0af2e7e374197035e29a200ae0`
+and summary
+`ev_b75b2da590e82a2a1fa4a4b99b217dad69b8115bab2a66b26453485a1ca42ae2`
+(642,249 AST nodes, 1,927 findings, partial due to the result budget).
+The travel panel evidence is `createState_行程设置`, `设置按下`,
+`设置抬起`, and the `O` clamp in `index.5627ed60.js`; the protocol
+evidence is `_sendMagnetismInfoSimpleCMD`, `setMagnetismInfoSimple`, and
+`getMultiMagnetismInfo` in `7a5b12c9.js`. Precision scaling is the
+existing `60ee4367.js` path.
+
+### Defaults and limits
+
+- Minimum press/release travel: `0.1 mm`.
+- Default press travel: `2.0 mm`; default release travel: `2.8 mm`.
+- Default deadzone: `0.3 mm` when op `6` has no usable value. The
+  original `get死区()` clamps the selected key's deadzone to `0..=1 mm`
+  before using it for the travel cap. The deadzone editor itself uses the
+  original `设置死区`/`get死区最大值` limits: `0..=1 mm` (`0..=4 mm` below
+  firmware 768), step `1 / scale` mm.
+- Full travel is selected exactly like the original:
+  `const y = version.rf ?? version.usb; y && y < 768 ? 4.0 : 3.3`.
+  RF therefore takes precedence over USB. Zero/absent counts as modern
+  firmware (`3.3 mm`). This build's `Jn.轴体行程最大值` is the constant
+  function `f => 3.3`, so all SK75 switch types share the 3.3 mm
+  configurable maximum; only firmware below 768 returns 4.0.
+- Both slider maxima are `full_travel - deadzone` (the original `O`
+  bound); the release setter additionally clamps release to that same
+  maximum.
+- Slider steps are one raw unit, i.e. `1 / scale` mm. The UI commits the
+  slider's raw value directly in u16 LE, so the displayed step and the
+  written step always match. The original converts its mm double with
+  `const l = value * get磁轴行程步进倍数(); c = [l & 255, l >> 8]`;
+  the bitwise ops truncate toward zero (no rounding). `proto::mm_to_raw`
+  reproduces that for the mm constants/defaults (including the original's
+  `0.29 * 100 -> 28` truncation), normalising the f32 input to six
+  decimals first so 2.8/3.3 keep their exact integer raw values.
+- The UI loads the selected key's current op-0/op-1 values, falls back
+  to 2.0/2.8 for zero/unread values, and clamps both to the computed
+  limits.
+
+### Single-slot write
+
+The original `_sendMagnetismInfoSimpleCMD(op, slot, last, data)` builds
+an 8-byte header and appends the payload:
+
+```text
+[101, op, 0, slot, last, 0, 0, checksum] + [raw_lo, raw_hi]
+```
+
+- `op 0` is press `TRAVEL`; `op 1` is release `LIFT_TRAVEL`; `op 6`
+  writes and reads `DEADZONE`.
+- `setMagnetismInfoSimple(newState, previousState)` only pushes an op when
+  the new value differs from the key model loaded by the previous read:
+  `"travel" in t && ("travel" in e && t.travel !== e.travel || !("travel" in e))`,
+  and likewise for `liftTravel` and `deadZoneTravel`. Missing previous
+  fields count as changed. **Write key** therefore diffs the pending
+  values against the last op-0/op-1/op-6 read and sends only the changed
+  ops in order (`0, 1, 6`); if nothing changed it sends no packet and no
+  vendor sleep.
+- `last = 1` applies the queued change and is set only on the final
+  changed op in the batch. One 100 ms vendor sleep follows a non-empty
+  travel/deadzone batch.
+- The op-252 switch write is also conditional in the original
+  (`支持更换轴体 && "轴体" in t && e?.轴体 !== t.轴体`); it is sent after
+  the travel batch with `last = 1`, followed by another 100 ms sleep.
+  When the switch code is unchanged, no op-252 packet is sent.
+- The toggle-off path sends the Press value to both op 0 and op 1; the
+  toggle-on path sends the pending press and release values separately.
+  This matches the original `设置按下`/`设置抬起` model while keeping
+  edits pending until **Write key**. The diff is applied afterwards, so
+  e.g. toggle-off with an unchanged Press but a stored release of 2.8 mm
+  sends only op 1.
+- Op `0`, op `1`, and op `6` reads each use four pages
+  (`GET_MULTI_MAGNETISM` op, pages 0–3) = 256 bytes = 128 u16 LE
+  values. Press/release are refreshed together with switch types, and
+  deadzone is refreshed at the same time.
+
+### Editor behavior
+
+- **Press travel** is always visible. Moving any slider only updates the
+  pending UI value; no HID write or read happens until **Write key**.
+- With **Set press and release travel separately** off, **Write key**
+  writes the same Press value to both ops and clamps it to full travel
+  minus deadzone. Enabling the checkbox exposes **Release travel**; both
+  pending values then commit to their own ops.
+- The **Deadzone** slider edits op 6. Its maximum is 1.0 mm (4.0 mm
+  below firmware 768); changing it also clamps the pending press/release
+  values. The travel cap itself keeps the original 0–1.0 mm
+  `get死区()` clamp.
+- After a successful **Write key**, the UI waits an extra 200 ms, then
+  performs the full Read all (keyboard info, bindings, switch types,
+  travels and deadzone), reselects the same key, re-seeds every picker,
+  and reports whether the read-back matched the requested values.
+- The separate-release checkbox is UI-only state, matching the original
+  `is单独设置按下抬起行程_非RT` toggle; it is not stored on the keyboard.
+  On every read/selection sync it is derived solely from the stored values:
+  on when `press != release`, off when they are equal or unknown. It stays
+  a normal control while the user is editing, but no per-slot choice is
+  remembered after a read.
+- The keyboard persists the actual travel/deadzone values; there is no
+  per-key mode flag to read back.
+
+### Post-write read settling (hardware-verified)
+
+The keyboard applies travel writes asynchronously. Probing the attached
+SK75 TMR (`3151:5030`) showed that a `GET_FEATURE` issued immediately after
+a write is answered with the *request payload itself* for roughly
+150–180 ms, then normal data resumes. The original driver avoids this
+window by updating its local model after a write instead of re-reading.
+This recreation performs a full Read all, so it now:
+
+1. keeps the original 100 ms vendor sleep after the final write;
+2. waits an additional 200 ms before starting the refresh; and
+3. detects a request echo in data-bearing reads (`GET_MULTI_MAGNETISM` and
+   keymap pages) and retries up to four times at 50 ms intervals. If the
+   echo persists, the read fails with an error instead of displaying the
+   echoed bytes as keymap/travel values.
+
+Hardware verification on the attached keyboard, using the same Rust
+transport and packet builders (`slot 72`, all values restored afterwards):
+
+```text
+original op0/op1/op6 slot 72: (50, 50, 5)
+after press-only write (60, 50, 5): (60, 50, 5)
+after release-only write (60, 60, 5): (60, 60, 5)
+after deadzone-only write (60, 60, 10): (60, 60, 10)
+restored: (50, 50, 5)
+```
+
+This confirms op `0` changes press travel, op `1` changes release travel,
+op `6` changes deadzone, and each write leaves the other fields untouched.
+Pacing is now the original 10 ms before send and 10 ms before read for
+normal traffic; the live op-254/255 path retains its explicit 1 ms pair.
+
+### Calibration completion fix
+
+Previously the cyan calibration overlay and locked bars remained after
+**Finish calibration**, hiding normal switch colors and live input. The
+overlay is now `Active`-phase only. Finish/cancel/failure:
+
+1. sends cmd 30 off (and cmd 28 off where needed);
+2. clears calibration raw/calibrated state and preview bars;
+3. restores the pre-calibration live-polling state;
+4. takes a fresh preview snapshot so the normal board is visible
+   immediately.
+
+The max-calibration-off command can make the hidraw node re-enumerate.
+When live input was enabled before calibration, polling therefore retries
+for 5 s (every 120 ms) instead of disabling itself on the first open
+failure. The live-input checkbox is disabled while calibration is
+running to prevent conflicting state changes. Cancel, error, and window
+close use the same restoration path.
+
+### Verification
+
+`cargo fmt --all`, `cargo test --all-targets` (58/58), and
+`cargo build --bin sk75-tmr-ui` pass. Travel tests cover defaults/limits,
+toggle-off same-value commits, toggle-on separate commits, diff-only op
+selection/order (`0,1,6`), final-op-only `last=1`, unknown-previous
+handling, JS truncation scaling, deadzone firmware maxima and op-6 write
+layout, request-echo detection, release-mode derivation from stored
+values, Active-only overlay behavior, calibration running state, and
+polling restoration.

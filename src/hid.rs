@@ -13,12 +13,55 @@ use std::time::Duration;
 use crate::proto::{self, ReportKind};
 
 pub const FEATURE_LEN: usize = 64;
-// Original pacing: most traffic uses 10 ms, but the live analog path
-// passes 1 ms explicitly (`_getMulitMagnetismCMD(254,4,1,1)`) and the live
-// loop re-polls with no sleep, so live reads always use 1 ms here.
-pub const SEND_DELAY: Duration = Duration::from_millis(1);
-pub const READ_DELAY: Duration = Duration::from_millis(1);
+// Original pacing (`pK` in index.5627ed60.js): `SEND_TIME=10`,
+// `READ_TIME=10`; `sendMsg` sleeps *before* `___sendFeature` and `readMsg`
+// sleeps *before* `___getFeature`. The live analog path overrides both with
+// `_getMulitMagnetismCMD(254, 4, 1, 1)`, so it keeps a 1 ms round-trip.
+pub const SEND_DELAY: Duration = Duration::from_millis(10);
+pub const READ_DELAY: Duration = Duration::from_millis(10);
+pub const LIVE_DELAY: Duration = Duration::from_millis(1);
 pub const VENDOR_SLEEP: Duration = Duration::from_millis(100);
+/// Extra wait before a post-write full refresh. Hardware probing shows the
+/// keyboard remains busy for about 150-180 ms after the vendor sleep.
+pub const POST_WRITE_SETTLE: Duration = Duration::from_millis(200);
+/// The keyboard applies travel writes asynchronously. Hardware probing shows
+/// it answers GET_FEATURE with the *request* payload for ~150-180 ms after a
+/// write, then starts returning fresh data. These retries cover that window
+/// for reads whose normal response begins with data (op 0/1/6/252/254 and
+/// keymaps), so a too-early read cannot be mistaken for real values.
+const ECHO_RETRIES: usize = 4;
+const ECHO_RETRY_DELAY: Duration = Duration::from_millis(50);
+
+/// One key's magnetism fields in raw units. `None` means "not known", which
+/// the original treats as changed (`!("travel" in previousState)`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TravelState {
+    pub press: Option<u16>,
+    pub lift: Option<u16>,
+    pub deadzone: Option<u16>,
+}
+
+/// Select the ops `setMagnetismInfoSimple` would actually send.
+///
+/// The original compares the edited key model with the model loaded from the
+/// keyboard and pushes an op only when the value differs (or when the
+/// previous model had no such field). Ops stay in the original order:
+/// press `0`, release `1`, deadzone `6`.
+pub fn changed_travel_ops(previous: TravelState, desired: TravelState) -> Vec<(u8, u16)> {
+    let mut ops = Vec::with_capacity(3);
+    for (op, prev, want) in [
+        (proto::mag_op::TRAVEL, previous.press, desired.press),
+        (proto::mag_op::LIFT_TRAVEL, previous.lift, desired.lift),
+        (proto::mag_op::DEADZONE, previous.deadzone, desired.deadzone),
+    ] {
+        if let Some(value) = want {
+            if prev != Some(value) {
+                ops.push((op, value));
+            }
+        }
+    }
+    ops
+}
 
 pub struct Sk75 {
     dev: HidDevice,
@@ -98,20 +141,17 @@ impl Sk75 {
     /// `payload` is the raw command (e.g. 8 B or 64 B, first byte = FEA_CMD).
     /// Report ID 0 is prepended for hidapi.
     pub fn send_msg(&self, payload: &[u8], kind: ReportKind) -> Result<()> {
-        self.send_msg_with_timing(payload, kind, SEND_DELAY, READ_DELAY)
+        self.send_msg_with_timing(payload, kind, SEND_DELAY)
     }
 
-    /// Timing-explicit variant. The original driver paces most traffic at
-    /// `SEND_TIME=10ms`/`READ_TIME=10ms` (`pK`), but the live analog path
-    /// `_getMulitMagnetismCMD(254,4,1,1)` passes `1,1` explicitly and the
-    /// `getJiaoZhunXinXiLoop` re-polls with no inter-poll sleep — i.e. the
-    /// live poll runs back-to-back at HID round-trip speed, not 10 Hz.
+    /// Timing-explicit variant matching JS `sendMsg(t, kind, delay)`: the
+    /// delay is taken **before** the feature report is written. Normal
+    /// traffic uses 10 ms; live op-254/255 polling uses 1 ms.
     pub fn send_msg_with_timing(
         &self,
         payload: &[u8],
         kind: ReportKind,
         send_delay: Duration,
-        _read_delay: Duration,
     ) -> Result<()> {
         let enc = proto::encode_cmd(payload.to_vec(), kind);
         let mut report = Vec::with_capacity(enc.len() + 1);
@@ -125,8 +165,10 @@ impl Sk75 {
         if report.len() != FEATURE_LEN + 1 {
             return Err(anyhow!("feature payload must be 65 bytes"));
         }
+        if !send_delay.is_zero() {
+            std::thread::sleep(send_delay);
+        }
         self.dev.send_feature_report(&report)?;
-        std::thread::sleep(send_delay);
         Ok(())
     }
 
@@ -143,10 +185,14 @@ impl Sk75 {
         send_delay: Duration,
         read_delay: Duration,
     ) -> Result<Vec<u8>> {
-        self.send_msg_with_timing(payload, kind, send_delay, read_delay)?;
+        self.send_msg_with_timing(payload, kind, send_delay)?;
         let mut buf = vec![0u8; FEATURE_LEN + 1];
         buf[0] = 0;
-        std::thread::sleep(read_delay);
+        // JS `readMsg` waits before `___getFeature`; without this the
+        // firmware can still return the previous command's report.
+        if !read_delay.is_zero() {
+            std::thread::sleep(read_delay);
+        }
         let n = self.dev.get_feature_report(&mut buf)?;
         buf.truncate(n.max(1));
         Ok(if buf.is_empty() {
@@ -154,6 +200,43 @@ impl Sk75 {
         } else {
             buf[1..].to_vec()
         })
+    }
+
+    /// True when `response` is just the last SET_FEATURE payload echoed back.
+    /// Only valid for commands whose normal response starts with data rather
+    /// than with the command byte (multi-magnetism and keymap reads).
+    fn response_is_request_echo(response: &[u8], request: &[u8]) -> bool {
+        let n = request.len().min(response.len());
+        n >= 8 && response[..n] == request[..n]
+    }
+
+    /// Read a data-bearing command, retrying if the keyboard is still busy
+    /// applying a previous write. Returns an error instead of passing the
+    /// echoed request off as data.
+    pub(crate) fn common_msg_data(&self, payload: &[u8], kind: ReportKind) -> Result<Vec<u8>> {
+        self.common_msg_data_with_timing(payload, kind, SEND_DELAY, READ_DELAY)
+    }
+
+    fn common_msg_data_with_timing(
+        &self,
+        payload: &[u8],
+        kind: ReportKind,
+        send_delay: Duration,
+        read_delay: Duration,
+    ) -> Result<Vec<u8>> {
+        let request = proto::encode_cmd(payload.to_vec(), kind);
+        for attempt in 0..=ECHO_RETRIES {
+            let r = self.common_msg_with_timing(payload, kind, send_delay, read_delay)?;
+            if !Self::response_is_request_echo(&r, &request) {
+                return Ok(r);
+            }
+            if attempt < ECHO_RETRIES {
+                std::thread::sleep(ECHO_RETRY_DELAY);
+            }
+        }
+        Err(anyhow!(
+            "keyboard echoed the read request instead of returning data (still applying a write); retry the read"
+        ))
     }
 
     pub fn vendor_sleep(dur: Option<Duration>) {
@@ -201,22 +284,33 @@ impl Sk75 {
         if let Some(p) = self.precision()? {
             return Ok(p.scale());
         }
-        let v = self.usb_version()?.unwrap_or(0);
-        Ok(proto::scale_from_version(
-            if v == 0 { None } else { Some(v) },
-            None,
-        ))
+        // The original prefers the RF version over USB for the fallback
+        // (`version.rf ?? version.usb`). `rf_version()` already maps 0 to
+        // None, matching `i || r` in `get磁轴行程步进倍数`. Version reads
+        // are best-effort so a missing RF reply does not hide USB, but if
+        // both fail return an error so callers can fall back to the scale
+        // already shown in the device info.
+        let usb_res = self.usb_version();
+        let rf_res = self.rf_version();
+        let usb = usb_res.as_ref().ok().and_then(|v| *v).filter(|v| *v != 0);
+        let rf = rf_res.as_ref().ok().and_then(|v| *v).filter(|v| *v != 0);
+        if usb_res.is_err() && rf_res.is_err() {
+            return Err(anyhow!("could not read USB/RF version for travel scale"));
+        }
+        Ok(proto::scale_from_version(usb, rf))
     }
 
     /// One `_getMulitMagnetismCMD(op, pages)` round: for each 0..pages,
     /// `commonMsg([229, op, 1, page], Bit7)` and concatenate the 64 B bodies.
     /// Mirrors JS failure semantics (zeros on timeout) via anyhow error instead.
+    /// Normal configuration reads use the driver's 10 ms send/read pacing.
     pub fn get_multi_magnetism(&self, op: u8, pages: u8) -> Result<Vec<u8>> {
         self.get_multi_magnetism_with_timing(op, pages, SEND_DELAY, READ_DELAY)
     }
 
-    /// Fast variant matching `_getMulitMagnetismCMD(op, pages, 1, 1)` used by
-    /// `_getJiaoZhunXinXi` (live op 254/255): 1 ms pacing per round-trip.
+    /// Timing-explicit variant. `_getJiaoZhunXinXi` (live op 254/255) calls
+    /// `_getMulitMagnetismCMD(op, 4, 1, 1)`, so live polling passes
+    /// `LIVE_DELAY` on both sides.
     pub fn get_multi_magnetism_with_timing(
         &self,
         op: u8,
@@ -227,8 +321,8 @@ impl Sk75 {
         let mut out = Vec::with_capacity(pages as usize * FEATURE_LEN);
         for page in 0..pages {
             let req = proto::build_get_multi_magnetism(op, page);
-            // Trim the 8 B builder to its significant prefix; send_msg pads.
-            let r = self.common_msg_with_timing(&req, ReportKind::Bit7, send_delay, read_delay)?;
+            let r =
+                self.common_msg_data_with_timing(&req, ReportKind::Bit7, send_delay, read_delay)?;
             out.extend_from_slice(&r);
         }
         Ok(out)
@@ -280,8 +374,8 @@ impl Sk75 {
         let blob = self.get_multi_magnetism_with_timing(
             proto::mag_op::LIVE_TRAVEL,
             4,
-            SEND_DELAY,
-            READ_DELAY,
+            LIVE_DELAY,
+            LIVE_DELAY,
         )?;
         Ok(proto::decode_u16le_list(&blob))
     }
@@ -299,6 +393,44 @@ impl Sk75 {
             proto::decode_u16le_list(&press),
             proto::decode_u16le_list(&lift),
         ))
+    }
+
+    /// Configured per-key deadzone (op 6, 4 pages). The original release
+    /// setter clamps to full travel minus this value; missing/unreadable
+    /// values fall back to the driver's 0.3 mm default in the UI.
+    pub fn deadzone_travel_raw(&self) -> Result<Vec<u16>> {
+        let blob = self.get_multi_magnetism(proto::mag_op::DEADZONE, 4)?;
+        Ok(proto::decode_u16le_list(&blob))
+    }
+
+    /// Write the selected key's magnetism values in one apply batch.
+    ///
+    /// Mirrors `setMagnetismInfoSimple(newState, previousState)`: only fields
+    /// whose raw value differs from the previously loaded key are sent.
+    /// Ops keep the original order: press travel (0), release travel (1),
+    /// deadzone (6). Only the final changed op carries `last=1`; a single
+    /// 100 ms vendor sleep follows a non-empty batch. If nothing changed,
+    /// no packet and no vendor sleep is emitted, exactly like the original.
+    ///
+    /// Returns the op codes actually sent. The switch type is a separate
+    /// op-252 write after this batch.
+    pub fn write_magnetism(
+        &self,
+        slot: usize,
+        previous: TravelState,
+        desired: TravelState,
+    ) -> Result<Vec<u8>> {
+        if slot > 127 {
+            return Err(anyhow!("slot {slot} out of range (0..127)"));
+        }
+        let ops = changed_travel_ops(previous, desired);
+        for req in proto::build_magnetism_batch(slot as u8, &ops) {
+            self.send_msg(&req, ReportKind::Bit7)?;
+        }
+        if !ops.is_empty() {
+            Self::vendor_sleep(None);
+        }
+        Ok(ops.into_iter().map(|(op, _)| op).collect())
     }
 
     /// Travel calibration switches (cmds 28 / 30).
@@ -327,5 +459,83 @@ impl Sk75 {
     pub fn calibrate_stop(&self) -> Result<()> {
         self.set_max_travel_cal(false)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn state(press: Option<u16>, lift: Option<u16>, deadzone: Option<u16>) -> TravelState {
+        TravelState {
+            press,
+            lift,
+            deadzone,
+        }
+    }
+
+    #[test]
+    fn only_changed_travel_fields_are_sent_in_original_order() {
+        let prev = state(Some(200), Some(280), Some(30));
+        // Press-only edit.
+        assert_eq!(
+            changed_travel_ops(prev, state(Some(250), Some(280), Some(30))),
+            vec![(proto::mag_op::TRAVEL, 250)]
+        );
+        // Release-only edit (this is what toggle-off produces when press was
+        // unchanged but the stored release differed).
+        assert_eq!(
+            changed_travel_ops(prev, state(Some(200), Some(200), Some(30))),
+            vec![(proto::mag_op::LIFT_TRAVEL, 200)]
+        );
+        // Deadzone-only edit.
+        assert_eq!(
+            changed_travel_ops(prev, state(Some(200), Some(280), Some(50))),
+            vec![(proto::mag_op::DEADZONE, 50)]
+        );
+        // Everything changes: original 0, 1, 6 order.
+        assert_eq!(
+            changed_travel_ops(prev, state(Some(210), Some(290), Some(40))),
+            vec![
+                (proto::mag_op::TRAVEL, 210),
+                (proto::mag_op::LIFT_TRAVEL, 290),
+                (proto::mag_op::DEADZONE, 40)
+            ]
+        );
+    }
+
+    #[test]
+    fn busy_request_echo_is_detected_but_travel_data_is_not() {
+        let req = proto::build_get_multi_magnetism(proto::mag_op::TRAVEL, 2);
+        let mut echo = req.clone();
+        echo.resize(FEATURE_LEN, 0);
+        assert!(Sk75::response_is_request_echo(&echo, &req));
+
+        // Real op-0 page data begins with press-travel u16s, not the request.
+        let mut data = vec![50u8, 0, 50, 0, 50, 0, 50, 0];
+        data.resize(FEATURE_LEN, 0);
+        assert!(!Sk75::response_is_request_echo(&data, &req));
+
+        // Short/garbage responses cannot be classified as an echo.
+        assert!(!Sk75::response_is_request_echo(&[229, 0, 1], &req));
+    }
+
+    #[test]
+    fn unchanged_or_unread_values_follow_js_semantics() {
+        let prev = state(Some(200), Some(280), Some(30));
+        // No changes -> empty batch (no packet, no vendor sleep).
+        assert!(changed_travel_ops(prev, prev).is_empty());
+        // Missing previous fields count as changed, like `!("travel" in e)`.
+        assert_eq!(
+            changed_travel_ops(
+                TravelState::default(),
+                state(Some(200), Some(280), Some(30))
+            ),
+            vec![
+                (proto::mag_op::TRAVEL, 200),
+                (proto::mag_op::LIFT_TRAVEL, 280),
+                (proto::mag_op::DEADZONE, 30)
+            ]
+        );
     }
 }
