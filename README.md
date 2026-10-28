@@ -1,6 +1,6 @@
 # sk75-tmr — WOMIER SK75 TMR Linux driver (Rust)
 
-## This is vibecoded as a proof of concept (REA testing with free AI models), use at your own risk (if somehow you manage to find this).
+## This is vibecoded as a proof of concept (REA testing with free AI models), use at your own risk (if somehow you manage to find this)
 
 Rust recreation of the Windows `womier-driver.exe` (WOMIER Driver 3.2.15)
 for the **SK75 TMR** analog keyboard, targeting Linux via raw HID feature
